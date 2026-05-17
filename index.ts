@@ -67,6 +67,21 @@ process.on('SIGTERM', () => {
   process.exit(0);
 });
 
+// Handle MCP stdio transport close. The MCP protocol's standard shutdown
+// signal is stdin close on the stdio transport, not POSIX signals. Without
+// these handlers, parent disconnect (e.g. `claude -p` exit) leaves cclsp
+// and its spawned LSP children orphaned, accumulating memory across
+// long-running parent sessions. See issue #47.
+process.stdin.on('close', () => {
+  lspClient.dispose();
+  process.exit(0);
+});
+
+process.stdin.on('end', () => {
+  lspClient.dispose();
+  process.exit(0);
+});
+
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
