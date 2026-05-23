@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { promises as fsPromises, readFileSync } from 'node:fs';
 import { logger } from '../logger.js';
 import { pathToUri } from '../utils.js';
 import type { JsonRpcTransport } from './json-rpc.js';
@@ -20,7 +20,8 @@ export class DocumentManager {
 
   /**
    * Ensure a file is open in the LSP server. If already open, returns false.
-   * If not open, reads the file, sends textDocument/didOpen, and returns true.
+   * If not open, reads the file synchronously, sends textDocument/didOpen, and
+   * returns true.
    */
   async ensureOpen(filePath: string): Promise<boolean> {
     if (this.openFiles.has(filePath)) {
@@ -32,30 +33,96 @@ export class DocumentManager {
 
     try {
       const fileContent = readFileSync(filePath, 'utf-8');
-      const uri = pathToUri(filePath);
-      const languageId = getLanguageId(filePath);
-
-      logger.debug(
-        `[DEBUG ensureOpen] File content length: ${fileContent.length}, languageId: ${languageId}\n`
-      );
-
-      this.transport.sendNotification('textDocument/didOpen', {
-        textDocument: {
-          uri,
-          languageId,
-          version: 1,
-          text: fileContent,
-        },
-      });
-
-      this.openFiles.add(filePath);
-      this.fileVersions.set(filePath, 1);
-      logger.debug(`[DEBUG ensureOpen] File opened successfully: ${filePath}\n`);
+      this.openWithContent(filePath, fileContent);
       return true;
     } catch (error) {
       logger.debug(`[DEBUG ensureOpen] Failed to open file ${filePath}: ${error}\n`);
       throw error;
     }
+  }
+
+  /**
+   * Async variant of {@link ensureOpen} using `fs.promises.readFile` instead of
+   * `readFileSync`. Same return semantics: if the file is already open, returns
+   * false; otherwise reads the file asynchronously, sends `textDocument/didOpen`,
+   * adds it to the open-files set, and returns true.
+   *
+   * Added for batch diagnostics workflows that should not block the event loop
+   * with synchronous reads.
+   */
+  async ensureOpenAsync(filePath: string): Promise<boolean> {
+    if (this.openFiles.has(filePath)) {
+      logger.debug(`[DEBUG ensureOpenAsync] File already open: ${filePath}\n`);
+      return false;
+    }
+
+    logger.debug(`[DEBUG ensureOpenAsync] Opening file: ${filePath}\n`);
+
+    try {
+      const fileContent = await fsPromises.readFile(filePath, 'utf-8');
+      this.openWithContent(filePath, fileContent);
+      return true;
+    } catch (error) {
+      logger.debug(`[DEBUG ensureOpenAsync] Failed to open file ${filePath}: ${error}\n`);
+      throw error;
+    }
+  }
+
+  /**
+   * Shared open path: send `textDocument/didOpen` for `filePath` with the given
+   * file content and record the file as open at version 1. Owns the
+   * `pathToUri` + `getLanguageId` + transport send + `openFiles.add` +
+   * `fileVersions.set` work that used to be duplicated across
+   * `ensureOpen` and `ensureOpenAsync`.
+   */
+  private openWithContent(filePath: string, fileContent: string): void {
+    const uri = pathToUri(filePath);
+    const languageId = getLanguageId(filePath);
+
+    logger.debug(
+      `[DEBUG openWithContent] File content length: ${fileContent.length}, languageId: ${languageId}\n`
+    );
+
+    this.transport.sendNotification('textDocument/didOpen', {
+      textDocument: {
+        uri,
+        languageId,
+        version: 1,
+        text: fileContent,
+      },
+    });
+
+    this.openFiles.add(filePath);
+    this.fileVersions.set(filePath, 1);
+    logger.debug(`[DEBUG openWithContent] File opened successfully: ${filePath}\n`);
+  }
+
+  /**
+   * Close a previously-opened document.
+   *
+   * 1. If the file is not currently tracked as open, returns silently.
+   * 2. Otherwise sends `textDocument/didClose` and removes the file from the
+   *    open set.
+   *
+   * We intentionally do NOT clear `fileVersions` here. The R3 batch-path
+   * contract forbids re-opening a file within the same batch, so the retained
+   * version is currently not consumed. It is preserved for inspection/debugging
+   * and to give future cross-batch reopen paths (not implemented in PR1) a
+   * starting point if they ever need monotonic versions.
+   */
+  closeDocument(filePath: string): void {
+    if (!this.openFiles.has(filePath)) {
+      logger.debug(`[DEBUG closeDocument] File not open: ${filePath}\n`);
+      return;
+    }
+
+    const uri = pathToUri(filePath);
+    this.transport.sendNotification('textDocument/didClose', {
+      textDocument: { uri },
+    });
+
+    this.openFiles.delete(filePath);
+    logger.debug(`[DEBUG closeDocument] File closed: ${filePath}\n`);
   }
 
   /**

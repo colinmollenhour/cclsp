@@ -59,9 +59,14 @@ export interface ServerState {
     sendMessage(message: LSPMessage): void;
     sendNotification(method: string, params: unknown): void;
     rejectAllPending(reason: string): void;
+    cancelRequest?(id: number): void;
+    registerProgressHandler?(token: string | number, handler: (value: unknown) => void): void;
+    unregisterProgressHandler?(token: string | number): void;
   };
   documentManager: {
     ensureOpen(filePath: string): Promise<boolean>;
+    ensureOpenAsync?(filePath: string): Promise<boolean>;
+    closeDocument?(filePath: string): void;
     sendChange(filePath: string, text: string): void;
     isOpen(filePath: string): boolean;
     getVersion(filePath: string): number;
@@ -83,8 +88,95 @@ export interface ServerState {
         checkInterval?: number;
       }
     ): Promise<void>;
+    setResultId?(uri: string, resultId: string): void;
+    getResultId?(uri: string): string | undefined;
   };
   adapter?: ServerAdapter;
+  /**
+   * LSP server capabilities captured from the `initialize` response.
+   * Only diagnostic-related fields are typed; the rest of the LSP
+   * capability surface is intentionally not modeled here.
+   */
+  capabilities?: ServerCapabilities;
+  /**
+   * Counter of in-flight batch operations against this server. Used by
+   * `ServerManager.restartServer` to defer scheduled restarts while
+   * batch diagnostics work is in progress. Default 0.
+   *
+   * Optional so partial-`ServerState` mock literals in tests don't need to
+   * initialize it; all read-sites must use `(state.inFlightBatchCount ?? 0)`
+   * so PR2 increments never observe `NaN`.
+   */
+  inFlightBatchCount?: number;
+}
+
+// --- Diagnostic-related types (LSP 3.17) -----------------------------------
+
+/**
+ * Server-side `DiagnosticOptions` capability (LSP 3.17).
+ */
+export interface DiagnosticOptions {
+  identifier?: string;
+  interFileDependencies: boolean;
+  workspaceDiagnostics: boolean;
+}
+
+/**
+ * Subset of `ServerCapabilities` that cclsp consumes. Only the
+ * diagnostic-related fields are typed.
+ */
+export interface ServerCapabilities {
+  diagnosticProvider?: DiagnosticOptions | boolean;
+}
+
+/**
+ * Entry passed in `workspace/diagnostic`'s `previousResultIds` array.
+ */
+export interface PreviousResultId {
+  uri: string;
+  value: string;
+}
+
+/**
+ * Params for the `workspace/diagnostic` LSP request.
+ */
+export interface WorkspaceDiagnosticParams {
+  identifier?: string;
+  previousResultIds: PreviousResultId[];
+  partialResultToken?: string | number;
+  workDoneToken?: string | number;
+}
+
+export interface WorkspaceFullDocumentDiagnosticReport {
+  uri: string;
+  version: number | null;
+  kind: 'full';
+  resultId?: string;
+  items: Diagnostic[];
+}
+
+export interface WorkspaceUnchangedDocumentDiagnosticReport {
+  uri: string;
+  version: number | null;
+  kind: 'unchanged';
+  resultId: string;
+}
+
+export type WorkspaceDocumentDiagnosticReport =
+  | WorkspaceFullDocumentDiagnosticReport
+  | WorkspaceUnchangedDocumentDiagnosticReport;
+
+export interface WorkspaceDiagnosticReport {
+  items: WorkspaceDocumentDiagnosticReport[];
+}
+
+export interface WorkspaceDiagnosticReportPartialResult {
+  items: WorkspaceDocumentDiagnosticReport[];
+}
+
+export interface ProgressParams<T = unknown> {
+  token: string | number;
+  value: T;
 }
 
 /**

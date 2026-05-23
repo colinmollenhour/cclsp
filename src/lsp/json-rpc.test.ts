@@ -197,6 +197,80 @@ describe('JsonRpcTransport', () => {
     });
   });
 
+  describe('handleIncoming dispatch (id=0 + id+method routing)', () => {
+    // The transport's auto-incrementing id starts at 1, but the response
+    // correlation branch must match by `id !== undefined && !method` so that
+    // an id of 0 still routes to a pending request (regressions of the prior
+    // `if (message.id && ...)` truthiness check). We seed the pending map
+    // directly to control the id under test.
+    it('routes id:0 response to pending request', async () => {
+      const pending = (
+        transport as unknown as {
+          pendingRequests: Map<
+            number,
+            { resolve: (value: unknown) => void; reject: (reason?: unknown) => void }
+          >;
+        }
+      ).pendingRequests;
+
+      const promise = new Promise<unknown>((resolve, reject) => {
+        pending.set(0, { resolve, reject });
+      });
+
+      mock.simulateResponse({
+        jsonrpc: '2.0',
+        id: 0,
+        result: { ok: true },
+      });
+
+      const result = await promise;
+      expect(result).toEqual({ ok: true });
+      // Pending entry consumed.
+      expect(pending.has(0)).toBe(false);
+      // Server-initiated request path NOT taken.
+      expect(messageHandler).not.toHaveBeenCalled();
+    });
+
+    it('treats id+method as server-initiated request, not a response', () => {
+      const pending = (
+        transport as unknown as {
+          pendingRequests: Map<
+            number,
+            { resolve: (value: unknown) => void; reject: (reason?: unknown) => void }
+          >;
+        }
+      ).pendingRequests;
+
+      let resolved = false;
+      let rejected = false;
+      pending.set(42, {
+        resolve: () => {
+          resolved = true;
+        },
+        reject: () => {
+          rejected = true;
+        },
+      });
+
+      // Server-initiated request: has both id and method. Must NOT consume the
+      // pending entry under id=42, must flow to the onMessage handler.
+      mock.simulateResponse({
+        jsonrpc: '2.0',
+        id: 42,
+        method: 'tsserver/request',
+        params: { foo: 'bar' },
+      });
+
+      expect(resolved).toBe(false);
+      expect(rejected).toBe(false);
+      expect(pending.has(42)).toBe(true);
+      expect(messageHandler).toHaveBeenCalledTimes(1);
+      expect(messageHandler).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 42, method: 'tsserver/request' })
+      );
+    });
+  });
+
   describe('rejectAllPending', () => {
     it('rejects all outstanding requests', async () => {
       const p1 = transport.sendRequest('method1', {}, 5000);

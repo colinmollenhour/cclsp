@@ -112,4 +112,30 @@ describe('DiagnosticsCache', () => {
       // Should resolve quickly since no updates are happening
     });
   });
+
+  describe('resultId tracking', () => {
+    it('round-trips resultId per URI and returns undefined for unset URIs', () => {
+      const uriA = 'file:///a.ts';
+      const uriB = 'file:///b.ts';
+
+      // Unset → undefined.
+      expect(cache.getResultId(uriA)).toBeUndefined();
+
+      // Set and read back.
+      cache.setResultId(uriA, 'rid-A-1');
+      expect(cache.getResultId(uriA)).toBe('rid-A-1');
+
+      // Independent per URI.
+      cache.setResultId(uriB, 'rid-B-1');
+      expect(cache.getResultId(uriB)).toBe('rid-B-1');
+      expect(cache.getResultId(uriA)).toBe('rid-A-1');
+
+      // Overwrite on second set.
+      cache.setResultId(uriA, 'rid-A-2');
+      expect(cache.getResultId(uriA)).toBe('rid-A-2');
+
+      // Still undefined for an unrelated URI.
+      expect(cache.getResultId('file:///never-set.ts')).toBeUndefined();
+    });
+  });
 });

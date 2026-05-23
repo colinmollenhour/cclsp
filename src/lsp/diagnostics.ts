@@ -10,6 +10,7 @@ export class DiagnosticsCache {
   private diagnostics = new Map<string, Diagnostic[]>();
   private lastUpdate = new Map<string, number>();
   private versions = new Map<string, number>();
+  private resultIds = new Map<string, string>();
 
   /**
    * Update cached diagnostics for a URI (called from publishDiagnostics handler).
@@ -27,6 +28,23 @@ export class DiagnosticsCache {
    */
   get(uri: string): Diagnostic[] | undefined {
     return this.diagnostics.get(uri);
+  }
+
+  /**
+   * Store a server-provided `resultId` for a URI. Used by the batch
+   * `workspace/diagnostic` and `textDocument/diagnostic` paths so that
+   * subsequent calls can populate `previousResultIds` and let the server
+   * answer with `kind: 'unchanged'` reports.
+   */
+  setResultId(uri: string, resultId: string): void {
+    this.resultIds.set(uri, resultId);
+  }
+
+  /**
+   * Retrieve the last known `resultId` for a URI, if any.
+   */
+  getResultId(uri: string): string | undefined {
+    return this.resultIds.get(uri);
   }
 
   /**

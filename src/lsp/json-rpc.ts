@@ -9,6 +9,24 @@ import type { LSPMessage } from './types.js';
 export type MessageHandler = (message: LSPMessage) => void;
 
 /**
+ * Handler for `$/progress` notification values, routed by token.
+ */
+export type ProgressHandler = (value: unknown) => void;
+
+/**
+ * Error rejected from a pending request when `cancelRequest` is called locally.
+ * The corresponding `$/cancelRequest` notification is sent to the server, but
+ * the local promise rejects immediately regardless of when (or whether) the
+ * server eventually responds.
+ */
+export class RequestCancelledError extends Error {
+  constructor(id: number) {
+    super(`LSP request cancelled (id=${id})`);
+    this.name = 'RequestCancelledError';
+  }
+}
+
+/**
  * JSON-RPC 2.0 transport over stdio with Content-Length framing.
  *
  * Handles:
@@ -26,6 +44,7 @@ export class JsonRpcTransport {
     { resolve: (value: unknown) => void; reject: (reason?: unknown) => void }
   > = new Map();
   private buffer = '';
+  private progressHandlers: Map<string | number, ProgressHandler> = new Map();
 
   constructor(
     private readonly process: ChildProcess,
@@ -79,17 +98,45 @@ export class JsonRpcTransport {
    */
   private handleIncoming(message: LSPMessage): void {
     // Response correlation: match responses to pending requests
-    if (message.id && this.pendingRequests.has(message.id)) {
-      const request = this.pendingRequests.get(message.id);
-      if (!request) return;
-      const { resolve, reject } = request;
-      this.pendingRequests.delete(message.id);
+    if (message.id !== undefined && !message.method) {
+      if (this.pendingRequests.has(message.id)) {
+        const request = this.pendingRequests.get(message.id);
+        if (!request) return;
+        const { resolve, reject } = request;
+        this.pendingRequests.delete(message.id);
 
-      if (message.error) {
-        reject(new Error(message.error.message || 'LSP Error'));
-      } else {
-        resolve(message.result);
+        if (message.error) {
+          reject(new Error(message.error.message || 'LSP Error'));
+        } else {
+          resolve(message.result);
+        }
+        return;
       }
+
+      // Late response (e.g. after cancelRequest). Drop silently at debug.
+      logger.debug(
+        `[DEBUG handleIncoming] Dropping response for unknown/cancelled request id=${message.id}\n`
+      );
+      return;
+    }
+
+    // Route $/progress notifications to the registered handler, keyed by token.
+    if (message.method === '$/progress') {
+      const params = message.params as { token?: string | number; value?: unknown } | undefined;
+      const token = params?.token;
+      if (token === undefined) {
+        logger.debug('[DEBUG handleIncoming] $/progress notification missing token\n');
+        return;
+      }
+      const handler = this.progressHandlers.get(token);
+      if (!handler) {
+        logger.debug(
+          `[DEBUG handleIncoming] No progress handler registered for token=${String(token)}\n`
+        );
+        return;
+      }
+      handler(params?.value);
+      return;
     }
 
     // Delegate notifications and server-initiated requests to the handler
@@ -162,5 +209,44 @@ export class JsonRpcTransport {
       params,
     };
     this.sendMessage(message);
+  }
+
+  /**
+   * Cancel an in-flight request.
+   *
+   * 1. If the request id is not in `pendingRequests`, this is a race (the
+   *    response already arrived or was dropped) — return silently without
+   *    sending the notification or rejecting any promise.
+   * 2. Otherwise: send `$/cancelRequest` to the server, reject the pending
+   *    promise locally with `RequestCancelledError`, and remove it from the
+   *    pending map. Any later response from the server with this id will be
+   *    dropped at debug log level.
+   */
+  cancelRequest(id: number): void {
+    const request = this.pendingRequests.get(id);
+    if (!request) {
+      // Race guard: response already settled or never tracked. Do not notify.
+      return;
+    }
+
+    this.sendNotification('$/cancelRequest', { id });
+
+    this.pendingRequests.delete(id);
+    request.reject(new RequestCancelledError(id));
+  }
+
+  /**
+   * Register a handler for `$/progress` notifications with the given token.
+   * Replaces any previously registered handler for that token.
+   */
+  registerProgressHandler(token: string | number, handler: ProgressHandler): void {
+    this.progressHandlers.set(token, handler);
+  }
+
+  /**
+   * Unregister the progress handler for the given token, if any.
+   */
+  unregisterProgressHandler(token: string | number): void {
+    this.progressHandlers.delete(token);
   }
 }

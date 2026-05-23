@@ -11,6 +11,7 @@ import type {
   InitializeParams,
   LSPMessage,
   LSPServerConfig,
+  ServerCapabilities,
   ServerState,
 } from './types.js';
 
@@ -139,6 +140,7 @@ export class ServerManager {
       restartTimer: undefined,
       diagnosticsCache,
       adapter,
+      inFlightBatchCount: 0,
     };
 
     // Store the resolve function to call when initialized notification is received
@@ -226,6 +228,9 @@ export class ServerManager {
             documentChanges: true,
           },
           workspaceFolders: true,
+          diagnostics: {
+            refreshSupport: false,
+          },
         },
       },
       rootUri: pathToUri(serverConfig.rootDir || process.cwd()),
@@ -269,6 +274,25 @@ export class ServerManager {
       : initializeParams;
 
     const initResult = await transport.sendRequest('initialize', finalParams);
+
+    // Capture server capabilities from the initialize response. We only
+    // consume the diagnostic-related fields; ServerCapabilities intentionally
+    // does not model the full LSP capability surface. Validate the inbound
+    // shape strictly so a server returning `{}`, `null`, or
+    // `{ capabilities: null }` leaves `serverState.capabilities` undefined.
+    const initRes = initResult as unknown;
+    if (
+      initRes &&
+      typeof initRes === 'object' &&
+      'capabilities' in initRes &&
+      (initRes as { capabilities: unknown }).capabilities &&
+      typeof (initRes as { capabilities: unknown }).capabilities === 'object'
+    ) {
+      serverState.capabilities = (initRes as { capabilities: ServerCapabilities }).capabilities;
+    }
+    logger.debug(
+      `[DEBUG startServer] Captured capabilities: diagnosticProvider=${JSON.stringify(serverState.capabilities?.diagnosticProvider)}\n`
+    );
 
     // Send the initialized notification after receiving the initialize response
     transport.sendNotification('initialized', {});
@@ -381,6 +405,25 @@ export class ServerManager {
 
   private async restartServer(serverState: ServerState): Promise<void> {
     const key = JSON.stringify(serverState.config);
+
+    // Defer restart while batch diagnostics work is in progress. Re-arm the
+    // restart timer for 5 seconds so we re-check shortly. The batch path is
+    // responsible for keeping this counter accurate via try/finally. The
+    // field is optional on `ServerState` so mocks may omit it; default to 0.
+    const inFlight = serverState.inFlightBatchCount ?? 0;
+    if (inFlight > 0) {
+      logger.debug(
+        `[DEBUG restartServer] Deferring restart for ${serverState.config.command.join(' ')}: ${inFlight} batch(es) in flight\n`
+      );
+      if (serverState.restartTimer) {
+        clearTimeout(serverState.restartTimer);
+      }
+      serverState.restartTimer = setTimeout(() => {
+        this.restartServer(serverState);
+      }, 5000);
+      return;
+    }
+
     logger.info(
       `[DEBUG restartServer] Restarting LSP server for ${serverState.config.command.join(' ')}\n`
     );
