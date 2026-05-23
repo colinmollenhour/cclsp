@@ -27,6 +27,24 @@ export class RequestCancelledError extends Error {
 }
 
 /**
+ * Error rejected from a pending request when the per-request timer elapses
+ * before the server responds. Preserves the historical message format
+ * `"LSP request timeout: <method> (<ms>ms)"` so legacy callers / tests that
+ * match by substring continue to work. Batch paths inspect the class to
+ * classify the rejection as a budget-driven drop (BUDGET) rather than a
+ * server crash (SERVER_CRASH).
+ */
+export class LSPRequestTimeoutError extends Error {
+  constructor(
+    public readonly method: string,
+    public readonly timeoutMs: number
+  ) {
+    super(`LSP request timeout: ${method} (${timeoutMs}ms)`);
+    this.name = 'LSPRequestTimeoutError';
+  }
+}
+
+/**
  * JSON-RPC 2.0 transport over stdio with Content-Length framing.
  *
  * Handles:
@@ -159,6 +177,24 @@ export class JsonRpcTransport {
    * Returns a promise that resolves with the result or rejects on error/timeout.
    */
   sendRequest(method: string, params: unknown, timeout = 30000): Promise<unknown> {
+    return this.sendCancellableRequest(method, params, timeout).promise;
+  }
+
+  /**
+   * Send a JSON-RPC request and expose the assigned id alongside the
+   * response promise. Batch paths need the id so they can call
+   * {@link cancelRequest} when a shared wall-clock deadline elapses.
+   *
+   * `sendRequest` is implemented in terms of this method; the public
+   * `sendRequest` signature is unchanged. Pass `timeout = Infinity` (or any
+   * very large value) to effectively disable the internal timer and rely
+   * solely on an external deadline race + `cancelRequest` for cancellation.
+   */
+  sendCancellableRequest(
+    method: string,
+    params: unknown,
+    timeout = 30000
+  ): { id: number; promise: Promise<unknown> } {
     const id = this.nextId++;
     const message: LSPMessage = {
       jsonrpc: '2.0',
@@ -167,25 +203,30 @@ export class JsonRpcTransport {
       params,
     };
 
-    return new Promise((resolve, reject) => {
-      const timeoutId = setTimeout(() => {
-        this.pendingRequests.delete(id);
-        reject(new Error(`LSP request timeout: ${method} (${timeout}ms)`));
-      }, timeout);
+    const promise = new Promise<unknown>((resolve, reject) => {
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
+      if (Number.isFinite(timeout)) {
+        timeoutId = setTimeout(() => {
+          this.pendingRequests.delete(id);
+          reject(new LSPRequestTimeoutError(method, timeout));
+        }, timeout);
+      }
 
       this.pendingRequests.set(id, {
         resolve: (value: unknown) => {
-          clearTimeout(timeoutId);
+          if (timeoutId !== undefined) clearTimeout(timeoutId);
           resolve(value);
         },
         reject: (reason?: unknown) => {
-          clearTimeout(timeoutId);
+          if (timeoutId !== undefined) clearTimeout(timeoutId);
           reject(reason);
         },
       });
 
       this.sendMessage(message);
     });
+
+    return { id, promise };
   }
 
   /**

@@ -53,12 +53,16 @@ export class VueLanguageServerAdapter implements ServerAdapter {
 
   getTimeout(method: string): number | undefined {
     // Vue language server can be slow on certain operations
-    // that require TypeScript analysis
+    // that require TypeScript analysis. The `workspace/diagnostic` entry
+    // is an upper-bound used only by the PR2 batch path; the bucket's
+    // shared deadline still clamps the real timeout via
+    // `Math.min(adapterMax, remaining)`.
     const timeouts: Record<string, number> = {
       'textDocument/documentSymbol': 60000, // 60 seconds
       'textDocument/definition': 45000, // 45 seconds
       'textDocument/references': 45000, // 45 seconds
       'textDocument/rename': 45000, // 45 seconds
+      'workspace/diagnostic': 60000, // 60 seconds (PR2 batch upper bound)
     };
     return timeouts[method];
   }

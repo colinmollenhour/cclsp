@@ -52,12 +52,14 @@
     "@types/inquirer": "^9.0.8",
     "ignore": "^7.0.5",
     "inquirer": "^12.6.3",
+    "picomatch": "^4.0.4",
     "typescript-language-server": "^4.3.4"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
     "@types/bun": "latest",
     "@types/node": "^24.0.1",
+    "@types/picomatch": "^4.0.3",
     "memfs": "^4.36.3"
   },
   "peerDependencies": {

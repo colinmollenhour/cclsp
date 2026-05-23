@@ -1,21 +1,56 @@
+import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { logger } from '../logger.js';
 import { pathToUri, uriToPath } from '../utils.js';
+import { LSPRequestTimeoutError, RequestCancelledError } from './json-rpc.js';
 import type {
   CallHierarchyIncomingCall,
   CallHierarchyItem,
   CallHierarchyOutgoingCall,
   Diagnostic,
+  DiagnosticsByFile,
   DocumentDiagnosticReport,
   DocumentSymbol,
   LSPLocation,
   Location,
+  PerFileBatchResult,
   Position,
+  PreviousResultId,
   ServerState,
   SymbolInformation,
   SymbolMatch,
+  WorkspaceDiagnosticOpResult,
+  WorkspaceDiagnosticReport,
+  WorkspaceDiagnosticReportPartialResult,
+  WorkspaceDocumentDiagnosticReport,
 } from './types.js';
 import { SymbolKind } from './types.js';
+
+/**
+ * Default per-server concurrency for `perFilePullBatch` and
+ * `pushFallbackBatch`. Tunable constant per the plan.
+ */
+export const BATCH_FILE_CONCURRENCY = 2;
+
+/**
+ * Minimum per-request timeout for batch paths. If less than this much
+ * budget remains, we drop the file instead of issuing the request.
+ */
+const MIN_PER_REQ_MS = 250;
+
+/**
+ * Default upper-bound timeout used when no adapter overrides it. Mirrors
+ * the default in the single-file ops.
+ */
+const DEFAULT_OP_TIMEOUT_MS = 30000;
+
+/**
+ * Maximum time we wait after the deadline for `closeDocument` cleanup and
+ * any cancellation rejections to settle before returning the bucket
+ * result. Pure safety net — under normal operation the rejects resolve
+ * synchronously inside `cancelRequest`.
+ */
+const CANCEL_GRACE_MS = 100;
 
 // --- Symbol Utilities ---
 
@@ -817,4 +852,572 @@ export async function outgoingCalls(
   }
 
   return [];
+}
+
+// --- Batch diagnostics operations (PR2) ----------------------------------
+
+/**
+ * Compute the per-request timeout from the shared deadline and an optional
+ * adapter-provided upper bound. Returns `null` when the remaining budget is
+ * below `MIN_PER_REQ_MS` (caller should drop the request as BUDGET).
+ */
+function computeBatchTimeout(
+  serverState: ServerState,
+  method: string,
+  deadline: number
+): number | null {
+  const remaining = deadline - Date.now();
+  if (remaining < MIN_PER_REQ_MS) return null;
+  const adapterMax = serverState.adapter?.getTimeout?.(method) ?? DEFAULT_OP_TIMEOUT_MS;
+  return Math.max(MIN_PER_REQ_MS, Math.min(adapterMax, remaining));
+}
+
+/**
+ * Returns true when an error from the transport is a *cancellation* (i.e.
+ * the batch path treats it as BUDGET, not SERVER_CRASH). This covers:
+ *
+ *  - `RequestCancelledError`: explicit `$/cancelRequest` via
+ *    `transport.cancelRequest(id)` at deadline.
+ *  - `LSPRequestTimeoutError`: the transport's per-request timer elapsed.
+ *    Batch paths pass very generous per-request timeouts and rely on the
+ *    deadline race + cancel propagation; if the internal timer still
+ *    fires, it's still a budget condition, not a server crash.
+ */
+function isCancelledError(err: unknown): boolean {
+  return err instanceof RequestCancelledError || err instanceof LSPRequestTimeoutError;
+}
+
+/**
+ * Returns true when an error from the transport is specifically the
+ * per-request timeout (separate from explicit cancellation).
+ */
+export function isTimeoutError(err: unknown): boolean {
+  return err instanceof LSPRequestTimeoutError;
+}
+
+/**
+ * Race `promise` against the shared deadline. If the deadline elapses, the
+ * returned promise rejects with `RequestCancelledError` and `onDeadline()`
+ * fires so the caller can propagate the cancellation to the transport
+ * (e.g., `transport.cancelRequest(id)` and/or aborting an AbortController).
+ *
+ * The original promise is NOT awaited after rejection; callers must ensure
+ * any cleanup happens via `onDeadline`.
+ */
+function deadlineRace<T>(
+  promise: Promise<T>,
+  deadline: number,
+  onDeadline?: () => void
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let settled = false;
+  return new Promise<T>((resolve, reject) => {
+    const ms = Math.max(0, deadline - Date.now());
+    timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try {
+        onDeadline?.();
+      } catch (e) {
+        logger.debug(`[DEBUG deadlineRace] onDeadline threw: ${e}\n`);
+      }
+      reject(new RequestCancelledError(-1));
+    }, ms);
+    promise.then(
+      (v) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        reject(e);
+      }
+    );
+  });
+}
+
+/**
+ * Execute `workspace/diagnostic` against a single server. Always passes
+ * `previousResultIds: []` (PR2 day-one contract) and a UUID
+ * `partialResultToken`. Accumulates `$/progress` partials and the final
+ * response items.
+ *
+ * Honors `kind: 'unchanged'` reports by treating them as empty (PR2 always
+ * sends empty `previousResultIds`, so a server returning "unchanged" is
+ * referring to a cache we don't ask it to consult — we'd rather report
+ * "no items" than show stale data).
+ */
+export async function workspaceDiagnostic(
+  serverState: ServerState,
+  options: {
+    deadline: number;
+    previousResultIds?: PreviousResultId[];
+    workspaceFolders?: string[];
+  }
+): Promise<WorkspaceDiagnosticOpResult> {
+  const { deadline } = options;
+  const previousResultIds = options.previousResultIds ?? [];
+  const partialResultToken = randomUUID();
+
+  await serverState.initializationPromise;
+
+  const method = 'workspace/diagnostic';
+  if (Date.now() >= deadline) {
+    logger.debug('[DEBUG workspaceDiagnostic] Deadline already elapsed; dropping with BUDGET\n');
+    return {
+      items: [],
+      partial: true,
+      partialReason: 'BUDGET',
+    };
+  }
+
+  // The per-request timer should practically never fire — the deadline
+  // race below is what enforces the wall-clock budget. We still pass an
+  // upper-bound timeout so a hung connection eventually surfaces via
+  // `LSPRequestTimeoutError` (which `isCancelledError` classifies as
+  // BUDGET).
+  const adapterMax = serverState.adapter?.getTimeout?.(method) ?? DEFAULT_OP_TIMEOUT_MS;
+  const remaining = deadline - Date.now();
+  const generousTimeout = Math.max(adapterMax, remaining) + CANCEL_GRACE_MS * 2;
+
+  const partials: WorkspaceDocumentDiagnosticReport[] = [];
+  const progressHandler = (value: unknown): void => {
+    const partial = value as WorkspaceDiagnosticReportPartialResult | undefined;
+    if (partial?.items && Array.isArray(partial.items)) {
+      partials.push(...partial.items);
+    }
+  };
+
+  const transport = serverState.transport;
+  transport.registerProgressHandler?.(partialResultToken, progressHandler);
+
+  try {
+    const params = {
+      previousResultIds,
+      partialResultToken,
+    };
+
+    // Prefer `sendCancellableRequest` if the transport exposes it so we
+    // can wire $/cancelRequest at the deadline. Fall back to the legacy
+    // `sendRequest` for older mock transports in tests.
+    let id: number | undefined;
+    let promise: Promise<unknown>;
+    if (transport.sendCancellableRequest) {
+      const handle = transport.sendCancellableRequest(method, params, generousTimeout);
+      id = handle.id;
+      promise = handle.promise;
+    } else {
+      promise = transport.sendRequest(method, params, generousTimeout);
+    }
+
+    let response: WorkspaceDiagnosticReport | undefined;
+    try {
+      const raw = await deadlineRace(promise, deadline, () => {
+        if (id !== undefined) {
+          try {
+            transport.cancelRequest?.(id);
+          } catch (e) {
+            logger.debug(`[DEBUG workspaceDiagnostic] cancelRequest threw: ${e}\n`);
+          }
+        }
+      });
+      response = raw as WorkspaceDiagnosticReport;
+    } catch (err) {
+      if (isCancelledError(err)) {
+        logger.debug('[DEBUG workspaceDiagnostic] Request cancelled (BUDGET)\n');
+        return {
+          items: mergeReports(partials, undefined),
+          partial: true,
+          partialReason: 'BUDGET',
+        };
+      }
+      // Server crash / process exit / generic LSP error.
+      logger.debug(`[DEBUG workspaceDiagnostic] Request error: ${err}\n`);
+      return {
+        items: mergeReports(partials, undefined),
+        partial: true,
+        partialReason: 'SERVER_CRASH',
+      };
+    }
+
+    return {
+      items: mergeReports(partials, response?.items ?? []),
+    };
+  } finally {
+    transport.unregisterProgressHandler?.(partialResultToken);
+  }
+}
+
+/**
+ * Convert a list of `WorkspaceDocumentDiagnosticReport` entries (partials
+ * + final) into the flat `DiagnosticsByFile[]` shape used by the tool
+ * layer. `'unchanged'` reports are treated as empty in PR2.
+ */
+function mergeReports(
+  partials: WorkspaceDocumentDiagnosticReport[],
+  finalItems: WorkspaceDocumentDiagnosticReport[] | undefined
+): DiagnosticsByFile[] {
+  const byUri = new Map<string, Diagnostic[]>();
+  const consume = (entries: WorkspaceDocumentDiagnosticReport[]): void => {
+    for (const entry of entries) {
+      if (!entry || !entry.uri) continue;
+      if (entry.kind === 'full') {
+        // Later "full" reports for the same URI overwrite earlier ones.
+        byUri.set(entry.uri, entry.items ?? []);
+      } else if (entry.kind === 'unchanged') {
+        logger.debug(
+          `[DEBUG workspaceDiagnostic] kind:'unchanged' for ${entry.uri} (PR2 treats as empty)\n`
+        );
+        if (!byUri.has(entry.uri)) byUri.set(entry.uri, []);
+      }
+    }
+  };
+  consume(partials);
+  if (finalItems) consume(finalItems);
+  return Array.from(byUri.entries()).map(([uri, items]) => ({ uri, items }));
+}
+
+/**
+ * Run a small concurrent worker pool over `files`, calling `worker(file)`
+ * for each. Stops dispatching new work once `Date.now() >= deadline`. The
+ * worker is responsible for honoring the deadline itself when issuing
+ * LSP requests; this pool only gates *new* dispatches.
+ *
+ * Returns `{ inFlightTracker }` so the caller can observe the maximum
+ * concurrency reached in tests (the value is the peak count). The pool
+ * always completes after every dispatched worker settles (resolve or
+ * reject) so cleanup can run in a `finally`.
+ */
+async function runWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  deadline: number,
+  worker: (item: T, signal: { cancelled: boolean }) => Promise<R>
+): Promise<{ results: Array<{ item: T; value?: R; error?: unknown }>; peakInFlight: number }> {
+  const results: Array<{ item: T; value?: R; error?: unknown }> = [];
+  let index = 0;
+  let inFlight = 0;
+  let peakInFlight = 0;
+  const signal = { cancelled: false };
+
+  const workersDone: Promise<void>[] = [];
+
+  const launchOne = async (): Promise<void> => {
+    while (true) {
+      if (signal.cancelled) return;
+      const i = index++;
+      if (i >= items.length) return;
+      if (Date.now() >= deadline) {
+        // Budget elapsed; record remaining as drops.
+        signal.cancelled = true;
+        return;
+      }
+      const item = items[i];
+      if (item === undefined) return;
+      inFlight++;
+      if (inFlight > peakInFlight) peakInFlight = inFlight;
+      try {
+        const value = await worker(item, signal);
+        results.push({ item, value });
+      } catch (error) {
+        results.push({ item, error });
+      } finally {
+        inFlight--;
+      }
+    }
+  };
+
+  const slots = Math.max(1, Math.min(concurrency, items.length));
+  for (let s = 0; s < slots; s++) {
+    workersDone.push(launchOne());
+  }
+  await Promise.all(workersDone);
+
+  return { results, peakInFlight };
+}
+
+/**
+ * Result returned by per-file fetchers to {@link runPerFileBucket}.
+ * `items` is the list of diagnostics for the file's URI.
+ */
+interface PerFileFetcherResult {
+  uri: string;
+  items: Diagnostic[];
+}
+
+/**
+ * Helpers a per-file fetcher receives from {@link runPerFileBucket}. The
+ * fetcher must use these so the bucket can propagate cancellation cleanly:
+ *
+ *  - `signal`: aborted when the deadline elapses. Pass to
+ *    `waitForIdle` and check before issuing new work.
+ *  - `runCancellable(method, params, timeout)`: wraps
+ *    `transport.sendCancellableRequest` (or `sendRequest`) and races against
+ *    the shared deadline. On timeout it calls `transport.cancelRequest(id)`
+ *    so the server frees its slot.
+ */
+interface PerFileFetcherHelpers {
+  signal: AbortSignal;
+  runCancellable: (method: string, params: unknown, timeout: number) => Promise<unknown>;
+}
+
+/**
+ * Shared per-file bucket worker pool. Owns the open/close discipline,
+ * dropCount bookkeeping, partial-flag aggregation, and deadline-driven
+ * cancellation. {@link perFilePullBatch} and {@link pushFallbackBatch} are
+ * thin wrappers supplying different fetchers.
+ */
+async function runPerFileBucket(
+  serverState: ServerState,
+  files: string[],
+  options: {
+    deadline: number;
+    concurrency?: number;
+    includeUnopened?: boolean;
+    logTag: string;
+  },
+  fetcher: (
+    filePath: string,
+    deadline: number,
+    helpers: PerFileFetcherHelpers
+  ) => Promise<PerFileFetcherResult>
+): Promise<PerFileBatchResult> {
+  const { deadline, logTag } = options;
+  const concurrency = options.concurrency ?? BATCH_FILE_CONCURRENCY;
+  const includeUnopened = options.includeUnopened ?? true;
+
+  await serverState.initializationPromise;
+
+  const openedByMe = new Set<string>();
+  const closedByMe = new Set<string>();
+  const items: DiagnosticsByFile[] = [];
+  let dropsBudget = 0;
+  let dropsCrash = 0;
+  let dropsUnreadable = 0;
+  let dropsNotOpen = 0;
+
+  const worker = async (file: string): Promise<void> => {
+    if (closedByMe.has(file)) {
+      // One-shot guarantee: do not reopen a file we already closed.
+      return;
+    }
+    const wasOpen = serverState.documentManager.isOpen(file);
+    if (!wasOpen && !includeUnopened) {
+      dropsNotOpen++;
+      return;
+    }
+
+    try {
+      if (!wasOpen) {
+        if (serverState.documentManager.ensureOpenAsync) {
+          await serverState.documentManager.ensureOpenAsync(file);
+        } else {
+          await serverState.documentManager.ensureOpen(file);
+        }
+        openedByMe.add(file);
+      }
+    } catch (err) {
+      logger.debug(`[DEBUG ${logTag}] Could not open ${file}: ${err}\n`);
+      dropsUnreadable++;
+      return;
+    }
+
+    const remaining = deadline - Date.now();
+    if (remaining < MIN_PER_REQ_MS) {
+      dropsBudget++;
+      if (openedByMe.has(file)) {
+        serverState.documentManager.closeDocument?.(file);
+        openedByMe.delete(file);
+        closedByMe.add(file);
+      }
+      return;
+    }
+
+    // Per-file AbortController tied to the shared deadline. Used by the
+    // fetcher to short-circuit `waitForIdle` calls and any other awaits
+    // that accept an AbortSignal.
+    const controller = new AbortController();
+
+    const runCancellable = async (
+      method: string,
+      params: unknown,
+      timeout: number
+    ): Promise<unknown> => {
+      const transport = serverState.transport;
+      let id: number | undefined;
+      let promise: Promise<unknown>;
+      if (transport.sendCancellableRequest) {
+        const handle = transport.sendCancellableRequest(method, params, timeout);
+        id = handle.id;
+        promise = handle.promise;
+      } else {
+        promise = transport.sendRequest(method, params, timeout);
+      }
+      return deadlineRace(promise, deadline, () => {
+        if (id !== undefined) {
+          try {
+            transport.cancelRequest?.(id);
+          } catch (e) {
+            logger.debug(`[DEBUG ${logTag}] cancelRequest threw: ${e}\n`);
+          }
+        }
+        controller.abort();
+      });
+    };
+
+    try {
+      const result = await fetcher(file, deadline, {
+        signal: controller.signal,
+        runCancellable,
+      });
+      items.push({ uri: result.uri, items: result.items });
+    } catch (err) {
+      if (isCancelledError(err)) {
+        controller.abort();
+        dropsBudget++;
+      } else {
+        logger.debug(`[DEBUG ${logTag}] Fetcher error for ${file}: ${err}\n`);
+        dropsCrash++;
+      }
+    } finally {
+      // Always abort to release any lingering signal-driven waits.
+      if (!controller.signal.aborted) controller.abort();
+      if (openedByMe.has(file)) {
+        serverState.documentManager.closeDocument?.(file);
+        openedByMe.delete(file);
+        closedByMe.add(file);
+      }
+    }
+  };
+
+  await runWithConcurrency(files, concurrency, deadline, worker);
+
+  // Anything not dispatched counts as BUDGET drop (deadline elapsed).
+  const dispatched = items.length + dropsBudget + dropsCrash + dropsUnreadable + dropsNotOpen;
+  const remaining = Math.max(0, files.length - dispatched);
+  dropsBudget += remaining;
+
+  let partial = false;
+  let partialReason: PerFileBatchResult['partialReason'] | undefined;
+  if (dropsCrash > 0) {
+    partial = true;
+    partialReason = 'SERVER_CRASH';
+  } else if (dropsBudget > 0) {
+    partial = true;
+    partialReason = 'BUDGET';
+  }
+
+  return {
+    items,
+    partial,
+    partialReason,
+    droppedCounts: {
+      budget: dropsBudget,
+      unreadable: dropsUnreadable,
+      serverCrash: dropsCrash,
+      notOpen: dropsNotOpen,
+    },
+  };
+}
+
+/**
+ * Per-file pull batch: for each file, open if needed → send
+ * `textDocument/diagnostic` → close if we opened it. One-shot per batch
+ * (R3) — a file we closed is NEVER re-opened in the same batch.
+ */
+export async function perFilePullBatch(
+  serverState: ServerState,
+  files: string[],
+  options: {
+    deadline: number;
+    concurrency?: number;
+    includeUnopened?: boolean;
+  }
+): Promise<PerFileBatchResult> {
+  return runPerFileBucket(
+    serverState,
+    files,
+    { ...options, logTag: 'perFilePullBatch' },
+    async (file, deadline, helpers) => {
+      const method = 'textDocument/diagnostic';
+      const timeout = computeBatchTimeout(serverState, method, deadline);
+      if (timeout === null) {
+        // Surface BUDGET via RequestCancelledError so the bucket counts
+        // this as a budget drop, not a crash.
+        throw new RequestCancelledError(-1);
+      }
+
+      const uri = pathToUri(file);
+      const raw = await helpers.runCancellable(method, { textDocument: { uri } }, timeout);
+
+      if (raw && typeof raw === 'object' && 'kind' in raw) {
+        const report = raw as DocumentDiagnosticReport;
+        if (report.kind === 'full') return { uri, items: report.items ?? [] };
+        return { uri, items: [] };
+      }
+      return { uri, items: [] };
+    }
+  );
+}
+
+/**
+ * Push fallback batch: for servers that advertise neither
+ * `textDocument/diagnostic` nor `workspace/diagnostic`. For each file:
+ * open if not already open → `waitForIdle` to collect `publishDiagnostics`
+ * → close if we opened it. One-shot per batch.
+ */
+export async function pushFallbackBatch(
+  serverState: ServerState,
+  files: string[],
+  options: {
+    deadline: number;
+    concurrency?: number;
+    includeUnopened?: boolean;
+  }
+): Promise<PerFileBatchResult> {
+  return runPerFileBucket(
+    serverState,
+    files,
+    { ...options, logTag: 'pushFallbackBatch' },
+    async (file, deadline, helpers) => {
+      const uri = pathToUri(file);
+      const remaining = deadline - Date.now();
+      if (remaining < MIN_PER_REQ_MS) {
+        throw new RequestCancelledError(-1);
+      }
+      const maxWaitTime = Math.max(MIN_PER_REQ_MS, Math.min(remaining, 5000));
+
+      // Race the wait against the shared deadline. The signal lets
+      // `waitForIdle` return immediately on cancellation rather than
+      // running its own poll loop to completion.
+      try {
+        await deadlineRace(
+          serverState.diagnosticsCache.waitForIdle(uri, {
+            maxWaitTime,
+            idleTime: 300,
+            signal: helpers.signal,
+          }),
+          deadline
+        );
+      } catch (err) {
+        // If the deadline fired but we already have cached diagnostics
+        // (e.g., the server published before the budget elapsed), surface
+        // them instead of counting this as a drop.
+        if (isCancelledError(err)) {
+          const cached = serverState.diagnosticsCache.get(uri);
+          if (cached !== undefined) {
+            return { uri, items: cached };
+          }
+        }
+        throw err;
+      }
+
+      const cached = serverState.diagnosticsCache.get(uri);
+      return { uri, items: cached ?? [] };
+    }
+  );
 }

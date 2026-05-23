@@ -50,6 +50,11 @@ export class DiagnosticsCache {
   /**
    * Wait for diagnostics to stabilize (no updates for `idleTime` ms).
    * Used as fallback when textDocument/diagnostic is not supported.
+   *
+   * Optionally accepts an `AbortSignal`; when aborted (either on entry or
+   * between polling iterations) the method returns immediately so callers
+   * racing against an external deadline can short-circuit cleanly. Existing
+   * call sites that omit `signal` see no behavior change.
    */
   async waitForIdle(
     uri: string,
@@ -57,9 +62,15 @@ export class DiagnosticsCache {
       maxWaitTime?: number;
       idleTime?: number;
       checkInterval?: number;
+      signal?: AbortSignal;
     } = {}
   ): Promise<void> {
-    const { maxWaitTime = 1000, idleTime = 100, checkInterval = 50 } = options;
+    const { maxWaitTime = 1000, idleTime = 100, checkInterval = 50, signal } = options;
+
+    if (signal?.aborted) {
+      logger.debug('[DEBUG waitForDiagnosticsIdle] Signal already aborted; returning early\n');
+      return;
+    }
 
     const startTime = Date.now();
     let lastVersion = this.versions.get(uri) ?? -1;
@@ -70,7 +81,15 @@ export class DiagnosticsCache {
     );
 
     while (Date.now() - startTime < maxWaitTime) {
+      if (signal?.aborted) {
+        logger.debug('[DEBUG waitForDiagnosticsIdle] Aborted mid-wait\n');
+        return;
+      }
       await new Promise((resolve) => setTimeout(resolve, checkInterval));
+      if (signal?.aborted) {
+        logger.debug('[DEBUG waitForDiagnosticsIdle] Aborted after poll tick\n');
+        return;
+      }
 
       const currentVersion = this.versions.get(uri) ?? -1;
       const currentUpdateTime = this.lastUpdate.get(uri) ?? lastUpdateTime;

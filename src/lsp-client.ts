@@ -1,7 +1,9 @@
 import { readFileSync } from 'node:fs';
-import { join, normalize, relative } from 'node:path';
+import { join, normalize, relative, resolve } from 'node:path';
+import { resolveFiles } from './file-glob.js';
 import { loadGitignore, scanDirectoryForExtensions } from './file-scanner.js';
 import { logger } from './logger.js';
+import { supportsTextDocumentDiagnostic, supportsWorkspaceDiagnostic } from './lsp/capabilities.js';
 import { loadConfig } from './lsp/config.js';
 import {
   getValidSymbolKinds,
@@ -13,24 +15,34 @@ import {
   hover as opsHover,
   incomingCalls as opsIncomingCalls,
   outgoingCalls as opsOutgoingCalls,
+  perFilePullBatch as opsPerFilePullBatch,
   prepareCallHierarchy as opsPrepareCallHierarchy,
+  pushFallbackBatch as opsPushFallbackBatch,
   renameSymbol as opsRenameSymbol,
+  workspaceDiagnostic as opsWorkspaceDiagnostic,
   workspaceSymbol as opsWorkspaceSymbol,
   symbolKindToString,
 } from './lsp/operations.js';
 import { ServerManager } from './lsp/server-manager.js';
 import type {
+  BatchDiagnosticsRequest,
+  BatchDiagnosticsResult,
   CallHierarchyIncomingCall,
   CallHierarchyItem,
   CallHierarchyOutgoingCall,
   Config,
   Diagnostic,
+  DiagnosticsByFile,
+  DroppedCounts,
   LSPServerConfig,
   Location,
+  PartialReason,
+  PerFileBatchResult,
   Position,
   ServerState,
   SymbolInformation,
   SymbolMatch,
+  WorkspaceDiagnosticOpResult,
 } from './lsp/types.js';
 import type { SymbolKind } from './lsp/types.js';
 import { uriToPath } from './utils.js';
@@ -273,6 +285,320 @@ export class LSPClient {
     return opsGetDiagnostics(serverState, filePath);
   }
 
+  /**
+   * Batch variant of `getDiagnostics`: collects diagnostics across many
+   * files in one call, bucketed by responsible LSP server, with a shared
+   * wall-clock deadline. Used by the `get_workspace_diagnostics` MCP tool.
+   *
+   * - When `paths`/`patterns` are present: resolves the file set via
+   *   `src/file-glob.ts`, buckets by responsible LSPServerConfig, and
+   *   uses per-server `textDocument/diagnostic` or push-fallback paths.
+   * - When both are empty: workspace scope. Each running server with
+   *   `workspaceDiagnostics` capability gets a single
+   *   `workspace/diagnostic` request; otherwise we fall back per-server
+   *   to currently-open files via the per-file pull or push paths.
+   * - `include_unopened=false` forces per-file paths and drops files that
+   *   are not already open in their LSP server.
+   *
+   * Never throws on cap hits — the result's `partial` / `partialReasons`
+   * carry that information so the tool layer can render a header.
+   */
+  async getDiagnosticsBatch(req: BatchDiagnosticsRequest): Promise<BatchDiagnosticsResult> {
+    const rootDir = req.root ? resolve(req.root) : process.cwd();
+    const respectGitignore = req.respectGitignore ?? true;
+    const includeUnopened = req.includeUnopened ?? true;
+    const maxFiles = req.maxFiles ?? 1000;
+    const timeBudgetMs = req.timeBudgetMs ?? 30000;
+
+    const hasPaths = !!req.paths && req.paths.length > 0;
+    const hasPatterns = !!req.patterns && req.patterns.length > 0;
+    const workspaceScope = !hasPaths && !hasPatterns;
+    const scope: BatchDiagnosticsResult['scope'] = workspaceScope
+      ? 'workspace'
+      : hasPaths && hasPatterns
+        ? 'paths+patterns'
+        : hasPaths
+          ? 'paths'
+          : 'patterns';
+
+    const droppedCounts: DroppedCounts = {
+      gitignored: 0,
+      notMatched: 0,
+      escaped: 0,
+      unreadable: 0,
+      maxFiles: 0,
+      budget: 0,
+      noServer: 0,
+      serverCrash: 0,
+      notOpen: 0,
+    };
+
+    const partialReasons = new Set<PartialReason>();
+
+    // 1. Resolve files for non-workspace scope.
+    let files: string[] = [];
+    if (!workspaceScope) {
+      const r = await resolveFiles({
+        paths: req.paths,
+        patterns: req.patterns,
+        root: rootDir,
+        respectGitignore,
+        includeUnopened,
+        maxFiles,
+      });
+      files = r.files;
+      droppedCounts.gitignored += r.droppedCounts.gitignored;
+      droppedCounts.notMatched += r.droppedCounts.notMatched;
+      droppedCounts.escaped += r.droppedCounts.escaped;
+      droppedCounts.unreadable += r.droppedCounts.unreadable;
+      droppedCounts.maxFiles += r.droppedCounts.maxFiles;
+      if (r.droppedCounts.maxFiles > 0) partialReasons.add('MAX_FILES');
+    }
+
+    // 2. Bucket files by responsible server config.
+    interface Bucket {
+      key: string;
+      serverConfig: LSPServerConfig;
+      files: string[];
+      /**
+       * When set, this workspace-scope bucket is forced into per-file
+       * pull mode (because `include_unopened=false` and we enumerated the
+       * server's currently-open files). The pull path will then run
+       * against `files` directly.
+       */
+      forcePerFile?: boolean;
+    }
+    const buckets = new Map<string, Bucket>();
+    const noServerFiles: string[] = [];
+    for (const file of files) {
+      const cfg = this.getServerForFile(file);
+      if (!cfg) {
+        noServerFiles.push(file);
+        continue;
+      }
+      const key = serverKey(cfg);
+      const bucket = buckets.get(key);
+      if (bucket) bucket.files.push(file);
+      else buckets.set(key, { key, serverConfig: cfg, files: [file] });
+    }
+    droppedCounts.noServer = (droppedCounts.noServer ?? 0) + noServerFiles.length;
+
+    // For workspace scope:
+    //   - When `include_unopened=false`, do NOT use workspace pull. Build
+    //     buckets from each running server's currently-open files (via the
+    //     PR1-additive `DocumentManager.listOpen()`), then force per-file
+    //     pull mode in `runBucket`. Configured-but-not-running servers
+    //     contribute nothing because they have no open files.
+    //   - When `include_unopened=true`, work against the union of all
+    //     configured servers — but skip buckets for servers whose
+    //     extensions have no match in a quick scan of `root`, unless the
+    //     server is already running (S3). Caches the scan result.
+    if (workspaceScope) {
+      if (!includeUnopened) {
+        const running = Array.from(this.serverManager.getRunningServers().values());
+        for (const serverState of running) {
+          const openFiles = serverState.documentManager.listOpen?.() ?? [];
+          for (const file of openFiles) {
+            const cfg = this.getServerForFile(file) ?? serverState.config;
+            const key = serverKey(cfg);
+            const bucket = buckets.get(key);
+            if (bucket) {
+              if (!bucket.files.includes(file)) bucket.files.push(file);
+              bucket.forcePerFile = true;
+            } else {
+              buckets.set(key, {
+                key,
+                serverConfig: cfg,
+                files: [file],
+                forcePerFile: true,
+              });
+            }
+          }
+        }
+      } else {
+        const runningKeys = new Set<string>();
+        for (const s of this.serverManager.getRunningServers().values()) {
+          runningKeys.add(serverKey(s.config));
+        }
+        const foundExts = await this.scanRootExtensions(rootDir, respectGitignore);
+        for (const cfg of this.config.servers) {
+          const key = serverKey(cfg);
+          if (buckets.has(key)) continue;
+          const overlap = cfg.extensions.some((ext) => foundExts.has(ext));
+          if (overlap || runningKeys.has(key)) {
+            buckets.set(key, { key, serverConfig: cfg, files: [] });
+          } else {
+            logger.debug(
+              `[getDiagnosticsBatch] Skipping bucket for ${key}: no matching extensions in ${rootDir}\n`
+            );
+          }
+        }
+      }
+    }
+
+    // 3. Single shared deadline.
+    const deadline = Date.now() + timeBudgetMs;
+
+    const items: DiagnosticsByFile[] = [];
+    const bucketSummaries: BatchDiagnosticsResult['buckets'] = [];
+    const partialBucketKeys: string[] = [];
+    const completedBucketKeys: string[] = [];
+
+    // 4. Run buckets in parallel.
+    const bucketPromises: Promise<void>[] = [];
+    for (const bucket of buckets.values()) {
+      bucketPromises.push(
+        this.runBucket({
+          bucket,
+          deadline,
+          workspaceScope,
+          includeUnopened,
+        })
+          .then((result) => {
+            for (const it of result.items) items.push(it);
+            bucketSummaries.push({
+              serverKey: bucket.key,
+              completed: !result.partial,
+              partialReason: result.partialReason,
+              fileCount: bucket.files.length,
+            });
+            if (result.partial) {
+              partialBucketKeys.push(bucket.key);
+              if (result.partialReason) partialReasons.add(result.partialReason);
+            } else {
+              completedBucketKeys.push(bucket.key);
+            }
+            // Merge bucket drops.
+            const dc = result.droppedCounts ?? {};
+            droppedCounts.budget = (droppedCounts.budget ?? 0) + (dc.budget ?? 0);
+            droppedCounts.unreadable += dc.unreadable ?? 0;
+            droppedCounts.serverCrash = (droppedCounts.serverCrash ?? 0) + (dc.serverCrash ?? 0);
+            droppedCounts.notOpen = (droppedCounts.notOpen ?? 0) + (dc.notOpen ?? 0);
+          })
+          .catch((err) => {
+            logger.error(`[getDiagnosticsBatch] Bucket ${bucket.key} threw: ${err}\n`);
+            partialBucketKeys.push(bucket.key);
+            partialReasons.add('SERVER_CRASH');
+            bucketSummaries.push({
+              serverKey: bucket.key,
+              completed: false,
+              partialReason: 'SERVER_CRASH',
+              fileCount: bucket.files.length,
+            });
+            droppedCounts.serverCrash = (droppedCounts.serverCrash ?? 0) + bucket.files.length;
+          })
+      );
+    }
+    await Promise.all(bucketPromises);
+
+    // F6: global BUDGET aggregation. If the shared deadline elapsed but no
+    // bucket flagged BUDGET (e.g., the buckets completed exactly at the
+    // wire), add BUDGET unless a higher-priority reason is already set.
+    if (Date.now() >= deadline) {
+      addReasonRespectingPriority(partialReasons, 'BUDGET');
+    }
+
+    // 5. Dedup defensively by (uri, line, character, code).
+    const seen = new Set<string>();
+    const dedupedItems: DiagnosticsByFile[] = [];
+    for (const file of items) {
+      const kept: Diagnostic[] = [];
+      for (const d of file.items) {
+        const key = `${file.uri}|${d.range.start.line}|${d.range.start.character}|${d.code ?? ''}|${d.message}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        kept.push(d);
+      }
+      dedupedItems.push({ uri: file.uri, items: kept });
+    }
+
+    const filesWithDiagnostics = dedupedItems.filter((f) => f.items.length > 0).length;
+    const filesConsidered = workspaceScope ? dedupedItems.length : files.length;
+
+    const partial = partialReasons.size > 0;
+
+    return {
+      items: dedupedItems,
+      buckets: bucketSummaries,
+      filesConsidered,
+      filesWithDiagnostics,
+      scope,
+      rootDir,
+      resolvedRoot: rootDir,
+      partial,
+      partialReasons: Array.from(partialReasons),
+      droppedCounts,
+      completedBucketKeys,
+      partialBucketKeys,
+    };
+  }
+
+  /**
+   * One-shot per call: quick scan of `root` for the set of file extensions
+   * present (depth=2, respecting `.gitignore` when requested). Used by
+   * workspace-scope bucket creation to skip servers whose extensions don't
+   * appear in the tree.
+   */
+  private async scanRootExtensions(
+    rootDir: string,
+    respectGitignore: boolean
+  ): Promise<Set<string>> {
+    try {
+      const ig = respectGitignore ? await loadGitignore(rootDir) : undefined;
+      return await scanDirectoryForExtensions(rootDir, 2, ig, false);
+    } catch (err) {
+      logger.debug(`[getDiagnosticsBatch] scanRootExtensions failed: ${err}\n`);
+      return new Set();
+    }
+  }
+
+  /**
+   * Run a single bucket: pick the strategy (workspace / per-file pull /
+   * push fallback) based on capability and scope, increment/decrement
+   * the in-flight counter, and return the bucket's op result.
+   */
+  private async runBucket(args: {
+    bucket: {
+      key: string;
+      serverConfig: LSPServerConfig;
+      files: string[];
+      forcePerFile?: boolean;
+    };
+    deadline: number;
+    workspaceScope: boolean;
+    includeUnopened: boolean;
+  }): Promise<WorkspaceDiagnosticOpResult | PerFileBatchResult> {
+    const { bucket, deadline, workspaceScope, includeUnopened } = args;
+    const serverState = await this.serverManager.getServer(bucket.serverConfig);
+    serverState.inFlightBatchCount = (serverState.inFlightBatchCount ?? 0) + 1;
+    try {
+      // Workspace-scope happy path: server supports workspace/diagnostic.
+      // Forced per-file (e.g., include_unopened=false) skips this branch.
+      if (
+        workspaceScope &&
+        includeUnopened &&
+        !bucket.forcePerFile &&
+        supportsWorkspaceDiagnostic(serverState)
+      ) {
+        return await opsWorkspaceDiagnostic(serverState, { deadline });
+      }
+
+      const filesForBucket = bucket.files;
+      if (supportsTextDocumentDiagnostic(serverState)) {
+        return await opsPerFilePullBatch(serverState, filesForBucket, {
+          deadline,
+          includeUnopened,
+        });
+      }
+      return await opsPushFallbackBatch(serverState, filesForBucket, {
+        deadline,
+        includeUnopened,
+      });
+    } finally {
+      serverState.inFlightBatchCount = Math.max(0, (serverState.inFlightBatchCount ?? 1) - 1);
+    }
+  }
+
   async hover(
     filePath: string,
     position: Position
@@ -390,4 +716,45 @@ export class LSPClient {
   dispose(): void {
     this.serverManager.dispose();
   }
+}
+
+/**
+ * Stable identity key for a server config used to bucket files in batch
+ * diagnostics. Mirrors locked-in decision 12 in the plan:
+ *   `serverKey = config.command.join(' ') + '@' + (config.rootDir ?? cwd)`.
+ * Ignores irrelevant fields like `restartInterval`.
+ */
+function serverKey(config: LSPServerConfig): string {
+  const root = config.rootDir ?? process.cwd();
+  return `${config.command.join(' ')}@${root}`;
+}
+
+/**
+ * Partial-reason priority used when aggregating across buckets. A higher
+ * index = higher priority. Aggregation only forces BUDGET (or any lower
+ * reason) when no higher-priority reason is already present.
+ *
+ *   SERVER_CRASH > BUDGET > MAX_FILES > MAX_DIAGNOSTICS > MAX_BYTES
+ */
+const PARTIAL_REASON_PRIORITY: PartialReason[] = [
+  'MAX_BYTES',
+  'MAX_DIAGNOSTICS',
+  'MAX_FILES',
+  'BUDGET',
+  'SERVER_CRASH',
+];
+
+/**
+ * Add `reason` to the running set unless a higher-priority reason is
+ * already present. Used by `getDiagnosticsBatch` to surface a global
+ * BUDGET status after `Promise.all` over buckets without overriding a
+ * SERVER_CRASH that happened in any bucket.
+ */
+function addReasonRespectingPriority(set: Set<PartialReason>, reason: PartialReason): void {
+  const incomingRank = PARTIAL_REASON_PRIORITY.indexOf(reason);
+  for (const existing of set) {
+    const r = PARTIAL_REASON_PRIORITY.indexOf(existing);
+    if (r > incomingRank) return; // already have a higher-priority reason
+  }
+  set.add(reason);
 }

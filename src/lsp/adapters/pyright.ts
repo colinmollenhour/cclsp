@@ -32,13 +32,16 @@ export class PyrightAdapter implements ServerAdapter {
   }
 
   getTimeout(method: string): number | undefined {
-    // Pyright can be slow on large projects
-    // Extend timeouts for operations that may analyze many files
+    // Pyright can be slow on large projects. The `workspace/diagnostic`
+    // entry is an upper bound used only by the PR2 batch path; the
+    // bucket's shared deadline still clamps the real timeout via
+    // `Math.min(adapterMax, remaining)`.
     const timeouts: Record<string, number> = {
       'textDocument/definition': 45000, // 45 seconds
       'textDocument/references': 60000, // 60 seconds
       'textDocument/rename': 60000, // 60 seconds
       'textDocument/documentSymbol': 45000, // 45 seconds
+      'workspace/diagnostic': 90000, // 90 seconds (PR2 batch upper bound)
     };
     return timeouts[method];
   }

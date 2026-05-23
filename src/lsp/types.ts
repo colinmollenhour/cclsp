@@ -56,6 +56,11 @@ export interface ServerState {
   process: ChildProcess;
   transport: {
     sendRequest(method: string, params: unknown, timeout?: number): Promise<unknown>;
+    sendCancellableRequest?(
+      method: string,
+      params: unknown,
+      timeout?: number
+    ): { id: number; promise: Promise<unknown> };
     sendMessage(message: LSPMessage): void;
     sendNotification(method: string, params: unknown): void;
     rejectAllPending(reason: string): void;
@@ -70,6 +75,12 @@ export interface ServerState {
     sendChange(filePath: string, text: string): void;
     isOpen(filePath: string): boolean;
     getVersion(filePath: string): number;
+    /**
+     * Snapshot of currently-open file paths. Order is undefined. Optional so
+     * partial-`ServerState` mock literals in tests don't need to provide it;
+     * the batch path treats absence as "no files open".
+     */
+    listOpen?(): string[];
   };
   initialized: boolean;
   initializationPromise: Promise<void>;
@@ -86,6 +97,7 @@ export interface ServerState {
         maxWaitTime?: number;
         idleTime?: number;
         checkInterval?: number;
+        signal?: AbortSignal;
       }
     ): Promise<void>;
     setResultId?(uri: string, resultId: string): void;
@@ -177,6 +189,117 @@ export interface WorkspaceDiagnosticReportPartialResult {
 export interface ProgressParams<T = unknown> {
   token: string | number;
   value: T;
+}
+
+// --- PR2 batch operation result types -------------------------------------
+
+/**
+ * Reason a partial result was returned. Maps 1:1 to the cap-hit header
+ * variants in the plan ("BUDGET", "MAX_FILES", "MAX_DIAGNOSTICS",
+ * "MAX_BYTES", "SERVER_CRASH").
+ */
+export type PartialReason =
+  | 'BUDGET'
+  | 'MAX_FILES'
+  | 'MAX_DIAGNOSTICS'
+  | 'MAX_BYTES'
+  | 'SERVER_CRASH';
+
+/**
+ * Counts of files dropped at the resolution/scan stage. Tools surface
+ * these in the rendered header.
+ */
+export interface DroppedCounts {
+  gitignored: number;
+  notMatched: number;
+  escaped: number;
+  unreadable: number;
+  maxFiles: number;
+  /** Files dropped because the budget elapsed before we could request them. */
+  budget?: number;
+  /** Files dropped because no LSP server matched their extension. */
+  noServer?: number;
+  /** Files dropped because their server-bucket crashed mid-batch. */
+  serverCrash?: number;
+  /** Files dropped because `include_unopened=false` and they weren't open. */
+  notOpen?: number;
+}
+
+/**
+ * Per-URI diagnostics item bundle returned by batch ops.
+ */
+export interface DiagnosticsByFile {
+  uri: string;
+  items: Diagnostic[];
+}
+
+/**
+ * Output of the `workspaceDiagnostic` op (single-bucket).
+ */
+export interface WorkspaceDiagnosticOpResult {
+  items: DiagnosticsByFile[];
+  partial?: boolean;
+  partialReason?: PartialReason;
+  droppedCounts?: Partial<DroppedCounts>;
+}
+
+/**
+ * Output of `perFilePullBatch` and `pushFallbackBatch`.
+ */
+export interface PerFileBatchResult {
+  items: DiagnosticsByFile[];
+  partial?: boolean;
+  partialReason?: PartialReason;
+  droppedCounts?: Partial<DroppedCounts>;
+}
+
+/**
+ * Input to `LSPClient.getDiagnosticsBatch`.
+ *
+ * If both `paths` and `patterns` are absent/empty the call falls back to
+ * workspace scope (workspace/diagnostic when supported by every bucket,
+ * otherwise the per-file pull path against open files).
+ */
+export interface BatchDiagnosticsRequest {
+  paths?: string[];
+  patterns?: string[];
+  root?: string;
+  respectGitignore?: boolean;
+  includeUnopened?: boolean;
+  minSeverity?: 'error' | 'warning' | 'information' | 'hint';
+  sources?: string[];
+  excludeCodes?: string[];
+  maxFiles?: number;
+  maxDiagnostics?: number;
+  maxBytes?: number;
+  timeBudgetMs?: number;
+  format?: 'summary' | 'by_file' | 'flat' | 'json';
+  groupBy?: 'file' | 'code' | 'source' | 'severity';
+}
+
+/**
+ * Output of `LSPClient.getDiagnosticsBatch` -- the tool layer renders this.
+ */
+export interface BatchDiagnosticsResult {
+  items: DiagnosticsByFile[];
+  buckets: Array<{
+    serverKey: string;
+    completed: boolean;
+    partialReason?: PartialReason;
+    fileCount: number;
+  }>;
+  filesConsidered: number;
+  filesWithDiagnostics: number;
+  scope: 'workspace' | 'paths' | 'patterns' | 'paths+patterns';
+  rootDir: string;
+  partial: boolean;
+  partialReasons: PartialReason[];
+  droppedCounts: DroppedCounts;
+  resolvedRoot: string;
+  /** Server-key strings for buckets that fully completed. */
+  completedBucketKeys: string[];
+  /** Server-key strings for buckets that finished partially. */
+  partialBucketKeys: string[];
 }
 
 /**

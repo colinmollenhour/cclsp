@@ -151,6 +151,18 @@ export class DocumentManager {
   }
 
   /**
+   * Returns a snapshot of currently-open file paths. Order is undefined.
+   *
+   * Used by the workspace-diagnostics batch path when
+   * `include_unopened=false` and no explicit `paths`/`patterns` were given,
+   * so the client can enumerate the union of files already open across
+   * every running server.
+   */
+  listOpen(): string[] {
+    return Array.from(this.openFiles);
+  }
+
+  /**
    * Get the current version number for a file.
    */
   getVersion(filePath: string): number {
