@@ -941,15 +941,25 @@ function deadlineRace<T>(
 }
 
 /**
- * Execute `workspace/diagnostic` against a single server. Always passes
- * `previousResultIds: []` (PR2 day-one contract) and a UUID
- * `partialResultToken`. Accumulates `$/progress` partials and the final
- * response items.
+ * Execute `workspace/diagnostic` against a single server. Always sends a
+ * UUID `partialResultToken` and a non-empty `previousResultIds` array
+ * when the server-state cache has any cached resultIds.
  *
- * Honors `kind: 'unchanged'` reports by treating them as empty (PR2 always
- * sends empty `previousResultIds`, so a server returning "unchanged" is
- * referring to a cache we don't ask it to consult — we'd rather report
- * "no items" than show stale data).
+ * PR3 result-id reuse:
+ *
+ *  - `previousResultIds` defaults to the snapshot returned by
+ *    `serverState.diagnosticsCache.listResultIds()`. Callers can pass an
+ *    explicit array (e.g. tests) to override this. First call returns
+ *    `[]` because no resultIds have been cached yet.
+ *  - For each `kind: 'full'` response entry with a `resultId`, we call
+ *    `setResultId(uri, resultId)` and `update(uri, items)` so subsequent
+ *    calls can request `unchanged` reports.
+ *  - For each `kind: 'unchanged'` response entry, we return the cached
+ *    items via `diagnosticsCache.get(uri)`. If no cache entry exists for
+ *    that URI (e.g. the cache was cleared between calls) we log at
+ *    debug level and return an empty list for that URI.
+ *
+ * Accumulates `$/progress` partials and the final response items.
  */
 export async function workspaceDiagnostic(
   serverState: ServerState,
@@ -960,7 +970,12 @@ export async function workspaceDiagnostic(
   }
 ): Promise<WorkspaceDiagnosticOpResult> {
   const { deadline } = options;
-  const previousResultIds = options.previousResultIds ?? [];
+  // PR3: build previousResultIds from the per-server cache when the caller
+  // does not supply one. This is the day-three contract — every workspace
+  // pull from now on advertises whatever resultIds we have cached so the
+  // server can answer with `kind: 'unchanged'` for unchanged files.
+  const previousResultIds =
+    options.previousResultIds ?? serverState.diagnosticsCache.listResultIds?.() ?? [];
   const partialResultToken = randomUUID();
 
   await serverState.initializationPromise;
@@ -1030,7 +1045,7 @@ export async function workspaceDiagnostic(
       if (isCancelledError(err)) {
         logger.debug('[DEBUG workspaceDiagnostic] Request cancelled (BUDGET)\n');
         return {
-          items: mergeReports(partials, undefined),
+          items: mergeReports(serverState, partials, undefined),
           partial: true,
           partialReason: 'BUDGET',
         };
@@ -1038,14 +1053,14 @@ export async function workspaceDiagnostic(
       // Server crash / process exit / generic LSP error.
       logger.debug(`[DEBUG workspaceDiagnostic] Request error: ${err}\n`);
       return {
-        items: mergeReports(partials, undefined),
+        items: mergeReports(serverState, partials, undefined),
         partial: true,
         partialReason: 'SERVER_CRASH',
       };
     }
 
     return {
-      items: mergeReports(partials, response?.items ?? []),
+      items: mergeReports(serverState, partials, response?.items ?? []),
     };
   } finally {
     transport.unregisterProgressHandler?.(partialResultToken);
@@ -1055,24 +1070,55 @@ export async function workspaceDiagnostic(
 /**
  * Convert a list of `WorkspaceDocumentDiagnosticReport` entries (partials
  * + final) into the flat `DiagnosticsByFile[]` shape used by the tool
- * layer. `'unchanged'` reports are treated as empty in PR2.
+ * layer.
+ *
+ * PR3 result-id reuse:
+ *
+ *  - `kind: 'full'` entries with a `resultId` are stored via
+ *    `diagnosticsCache.setResultId(uri, resultId)` and the items are
+ *    written through `diagnosticsCache.update(uri, items)` so a later
+ *    `unchanged` report can be answered from the cache.
+ *  - `kind: 'unchanged'` entries return the cached items via
+ *    `diagnosticsCache.get(uri)`. When no cache entry exists for the URI
+ *    (e.g. the cache was cleared between calls), we log at debug level
+ *    and return an empty list for that URI as a defensive fallback.
  */
 function mergeReports(
+  serverState: ServerState,
   partials: WorkspaceDocumentDiagnosticReport[],
   finalItems: WorkspaceDocumentDiagnosticReport[] | undefined
 ): DiagnosticsByFile[] {
   const byUri = new Map<string, Diagnostic[]>();
+  const cache = serverState.diagnosticsCache;
   const consume = (entries: WorkspaceDocumentDiagnosticReport[]): void => {
     for (const entry of entries) {
       if (!entry || !entry.uri) continue;
       if (entry.kind === 'full') {
+        const items = entry.items ?? [];
         // Later "full" reports for the same URI overwrite earlier ones.
-        byUri.set(entry.uri, entry.items ?? []);
+        byUri.set(entry.uri, items);
+        // Persist the resultId + items so a later call can request
+        // `unchanged` reports against them.
+        if (entry.resultId && cache.setResultId) {
+          cache.setResultId(entry.uri, entry.resultId);
+        }
+        // Always write through items so `kind: 'unchanged'` reuse on the
+        // next call has fresh data, even when the server omitted resultId.
+        cache.update(entry.uri, items);
       } else if (entry.kind === 'unchanged') {
-        logger.debug(
-          `[DEBUG workspaceDiagnostic] kind:'unchanged' for ${entry.uri} (PR2 treats as empty)\n`
-        );
-        if (!byUri.has(entry.uri)) byUri.set(entry.uri, []);
+        const cached = cache.get(entry.uri);
+        if (cached !== undefined) {
+          byUri.set(entry.uri, cached);
+        } else {
+          logger.debug(
+            `[DEBUG workspaceDiagnostic] kind:'unchanged' for ${entry.uri} with no cached entry; returning []\n`
+          );
+          if (!byUri.has(entry.uri)) byUri.set(entry.uri, []);
+        }
+        // Refresh the resultId so the server's latest opaque token wins.
+        if (entry.resultId && cache.setResultId) {
+          cache.setResultId(entry.uri, entry.resultId);
+        }
       }
     }
   };

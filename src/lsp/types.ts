@@ -102,6 +102,13 @@ export interface ServerState {
     ): Promise<void>;
     setResultId?(uri: string, resultId: string): void;
     getResultId?(uri: string): string | undefined;
+    /**
+     * Snapshot of `(uri, value)` pairs for every URI that has a cached
+     * `resultId`. Used by `workspaceDiagnostic` (PR3) to populate the LSP
+     * `previousResultIds` array on subsequent calls so the server can
+     * answer with `kind: 'unchanged'` reports.
+     */
+    listResultIds?(): Array<{ uri: string; value: string }>;
   };
   adapter?: ServerAdapter;
   /**

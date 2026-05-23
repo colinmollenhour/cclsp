@@ -265,7 +265,7 @@ describe('workspaceDiagnostic op', () => {
     expect(uris).toEqual(['file:///a.ts', 'file:///b.ts']);
   });
 
-  it("treats kind:'unchanged' reports as empty in PR2", async () => {
+  it("kind:'unchanged' returns empty when cache has no entry for the uri (defensive)", async () => {
     const transport = createMockTransport({
       sendRequest: jest.fn().mockResolvedValue({
         items: [
@@ -290,6 +290,57 @@ describe('workspaceDiagnostic op', () => {
     const result = await workspaceDiagnostic(state, { deadline: Date.now() + 5000 });
     expect(result.partial).toBeFalsy();
     expect(result.items).toEqual([{ uri: 'file:///a.ts', items: [] }]);
+  });
+
+  it("kind:'unchanged' returns cached items when present", async () => {
+    // PR3: when the server answers `unchanged` for a URI and the cache
+    // already holds items for it, `mergeReports` substitutes the cached
+    // items. This is the positive side of the contract — without it, the
+    // resultId-reuse optimization is useless because we'd always return [].
+    const cachedUri = 'file:///cached.ts';
+    const cachedItems: Diagnostic[] = [
+      {
+        range: { start: { line: 0, character: 0 }, end: { line: 0, character: 3 } },
+        severity: 1,
+        message: 'pre-cached error',
+        source: 'mock',
+      },
+    ];
+    // Pre-populate the cache as if a prior `full` call had already stored
+    // the items + resultId for this URI.
+    const cacheMap = new Map<string, Diagnostic[]>([[cachedUri, cachedItems]]);
+    const cache = createMockDiagnosticsCache(cacheMap);
+    cache.getResultId = jest.fn().mockReturnValue('rid-cached-1');
+
+    const transport = createMockTransport({
+      sendRequest: jest.fn().mockResolvedValue({
+        items: [
+          {
+            uri: cachedUri,
+            kind: 'unchanged',
+            version: 1,
+            resultId: 'rid-cached-1',
+          },
+        ],
+      }),
+    });
+    const state = buildState({
+      transport,
+      documentManager: createMockDocumentManager(),
+      diagnosticsCache: cache,
+      capabilities: {
+        diagnosticProvider: { interFileDependencies: true, workspaceDiagnostics: true },
+      },
+    });
+
+    const result = await workspaceDiagnostic(state, { deadline: Date.now() + 5000 });
+
+    expect(result.partial).toBeFalsy();
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0]?.uri).toBe(cachedUri);
+    expect(result.items[0]?.items).toEqual(cachedItems);
+    // The op consults the cache to resolve `unchanged`.
+    expect(cache.get).toHaveBeenCalledWith(cachedUri);
   });
 
   it('returns BUDGET when deadline is already past', async () => {

@@ -48,6 +48,23 @@ export class DiagnosticsCache {
   }
 
   /**
+   * Returns a snapshot of `(uri, value)` pairs for every URI that has a
+   * cached `resultId`. Used to build the `previousResultIds` array for
+   * `workspace/diagnostic` requests so the server can answer with
+   * `kind: 'unchanged'` reports on subsequent calls.
+   *
+   * Order is undefined. The returned array is a fresh copy — mutating it
+   * does not affect the cache.
+   */
+  listResultIds(): Array<{ uri: string; value: string }> {
+    const out: Array<{ uri: string; value: string }> = [];
+    for (const [uri, value] of this.resultIds) {
+      out.push({ uri, value });
+    }
+    return out;
+  }
+
+  /**
    * Wait for diagnostics to stabilize (no updates for `idleTime` ms).
    * Used as fallback when textDocument/diagnostic is not supported.
    *

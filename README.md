@@ -36,6 +36,7 @@ https://github.com/user-attachments/assets/52980f32-64d6-4b78-9cbf-18d6ae120cdd
   - [`rename_symbol`](#rename_symbol)
   - [`rename_symbol_strict`](#rename_symbol_strict)
   - [`get_diagnostics`](#get_diagnostics)
+  - [`get_workspace_diagnostics`](#get_workspace_diagnostics)
   - [`restart_server`](#restart_server)
 - [💡 Real-world Examples](#-real-world-examples)
   - [Finding Function Definitions](#finding-function-definitions)
@@ -434,6 +435,83 @@ Get language diagnostics (errors, warnings, hints) for a file. Uses LSP textDocu
 
 **Parameters:**
 - `file_path`: The path to the file to get diagnostics for
+
+### `get_workspace_diagnostics`
+
+Get diagnostics across many files in one call. Designed for cleanup workflows where an agent needs an inventory of warnings and errors across the codebase. Uses LSP `workspace/diagnostic` when the server supports it, otherwise falls back to per-file pull or `didOpen` + `publishDiagnostics`. Diagnostics are bucketed by responsible LSP server and run in parallel against a single shared wall-clock budget; partial results are reported with a clear cap-hit header instead of an error.
+
+**Parameters:**
+
+- `paths`: Explicit list of file paths. May be combined with `patterns`; the final file set is the union (optional)
+- `patterns`: Glob patterns relative to `root`. Negation entries beginning with `!` are subtracted from the matched set (negation does NOT remove explicit `paths` entries) (optional)
+- `root`: Root directory for `patterns` resolution and workspace-scope walking (optional, default: process cwd)
+- `respect_gitignore`: Honor `.gitignore` when resolving `patterns` and walking the workspace (optional, default: true)
+- `include_unopened`: If false, only return diagnostics for files already open in their LSP server. With workspace scope, forces per-file pull mode against open files only (optional, default: true)
+- `min_severity`: One of `error`, `warning`, `information`, `hint`. Defaults to `warning` for cleanup workflows — use `error` to focus on errors only (optional, default: `warning`)
+- `sources`: Whitelist of diagnostic sources, e.g. `["typescript", "eslint"]` (optional)
+- `exclude_codes`: Blacklist of diagnostic codes in string form (optional)
+- `max_files`: Cap on the number of files inspected. Excess files are dropped before any LSP request (optional, default: 1000, min: 1, max: 10000)
+- `max_diagnostics`: Cap on the number of diagnostics rendered. Highest-severity entries win (optional, default: 500, min: 1, max: 5000)
+- `max_bytes`: Hard limit on rendered output size. Oversized `by_file` output auto-falls back to `summary` (optional, default: 32768, min: 1024, max: 524288)
+- `time_budget_ms`: Wall-clock budget for the whole call across every bucket (optional, default: 30000, min: 1000, max: 120000)
+- `format`: One of `summary`, `by_file`, `flat`, `json` (optional, default: `by_file`)
+- `group_by`: One of `file`, `code`, `source`, `severity` (optional, default: `file`)
+
+`paths` and `patterns` may both be supplied; the resulting file set is the union, and negation entries in `patterns` only filter pattern-resolved entries (explicit `paths` always survive). If both are absent the call uses whole-workspace scope.
+
+**Usage examples:**
+
+Get diagnostics for three specific files:
+
+```json
+{
+  "paths": [
+    "src/foo.ts",
+    "src/bar.py",
+    "src/baz.go"
+  ],
+  "min_severity": "warning"
+}
+```
+
+Glob pattern across the TypeScript surface, excluding tests:
+
+```json
+{
+  "patterns": [
+    "src/**/*.ts",
+    "!src/**/*.test.ts"
+  ],
+  "min_severity": "error"
+}
+```
+
+Whole-workspace scope (no `paths`, no `patterns`). The wall-clock budget applies, and a partial result may be returned if the budget or another cap is hit:
+
+```json
+{
+  "min_severity": "warning",
+  "time_budget_ms": 30000
+}
+```
+
+**Cap-hit messaging:**
+
+The tool never returns an error result for cap hits — instead, the header reports a `PARTIAL` status with one or more cap reasons (`BUDGET`, `MAX_FILES`, `MAX_DIAGNOSTICS`, `MAX_BYTES`, `SERVER_CRASH`) and the explicit guidance "do NOT retry with the same args — narrow scope":
+
+```
+get_workspace_diagnostics — PARTIAL
+[!] Wall-clock budget exhausted (BUDGET): 30000 ms reached after collecting 312/?? diagnostics across 47/?? files.
+[!] do NOT retry with the same args — narrow scope (use `paths` or `patterns`, or raise `time_budget_ms` up to 120000).
+```
+
+```
+get_workspace_diagnostics — PARTIAL
+[!] Diagnostic cap hit (MAX_DIAGNOSTICS): 500/1247 diagnostics rendered (highest severity first).
+[!] do NOT retry with the same args — narrow scope (raise `min_severity` to `error`, or narrow `paths`).
+```
+
+When you see a cap-hit banner, do NOT retry the same arguments — instead, narrow the scope with `paths`/`patterns`, raise `min_severity`, or raise the relevant cap up to its documented maximum.
 
 ### `restart_server`
 

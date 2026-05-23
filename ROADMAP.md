@@ -13,6 +13,10 @@ Make cclsp the go-to MCP server for Language Server Protocol integration, enabli
 - ✅ TypeScript/JavaScript support out of the box
 - ✅ Basic error handling and logging
 
+## Recently Shipped
+
+- ✅ `get_workspace_diagnostics` — batch diagnostics across many files in one call, with globs, time budgets, cap-hit banners, and LSP `workspace/diagnostic` result-id reuse for fast repeat calls.
+
 ## Short-term Goals (Next 3 months)
 
 ### v1.1 - Enhanced Language Support
