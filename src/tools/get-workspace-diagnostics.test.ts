@@ -208,6 +208,25 @@ describe('get_workspace_diagnostics MCP tool', () => {
     expect(text).toContain('pylsp@/repo');
   });
 
+  it('shows MAX_BYTES banner when summary output is hard-truncated', async () => {
+    const items = Array.from({ length: 200 }, (_, i) => ({
+      uri: `file:///very/long/path/file-${i}.ts`,
+      items: [mkDiag({ severity: 1, message: `err${i}`, code: `C${i}` })],
+    }));
+    const client = createMockClient(
+      buildBatchResult({
+        items,
+        filesConsidered: items.length,
+        filesWithDiagnostics: items.length,
+      })
+    );
+    const result = await callHandler({ format: 'summary', max_bytes: 1024 }, client);
+    const text = result.content[0]?.text ?? '';
+    expect(text).toContain('get_workspace_diagnostics — PARTIAL');
+    expect(text).toContain('Output size cap hit (MAX_BYTES)');
+    expect(text).toContain('output truncated');
+  });
+
   it('clamps invalid integer args to defaults', async () => {
     const client = createMockClient(buildBatchResult({}));
     await callHandler(

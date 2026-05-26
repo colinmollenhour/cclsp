@@ -70,6 +70,19 @@ describe('DocumentManager.ensureOpenAsync', () => {
     expect(transport.sendNotification).toHaveBeenCalledTimes(1);
   });
 
+  it('does not send duplicate didOpen when opened during async read', async () => {
+    const filePath = join(TEST_DIR, 'a.ts');
+    await writeFile(filePath, 'export const x = 1;');
+
+    const asyncOpen = manager.ensureOpenAsync(filePath);
+    const syncOpened = await manager.ensureOpen(filePath);
+    const asyncOpened = await asyncOpen;
+
+    expect(syncOpened).toBe(true);
+    expect(asyncOpened).toBe(false);
+    expect(transport.sendNotification).toHaveBeenCalledTimes(1);
+  });
+
   it('throws when the file does not exist', async () => {
     const filePath = join(TEST_DIR, 'nonexistent.ts');
     await expect(manager.ensureOpenAsync(filePath)).rejects.toThrow();

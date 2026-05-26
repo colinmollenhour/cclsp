@@ -426,7 +426,21 @@ export class LSPClient {
           if (buckets.has(key)) continue;
           const overlap = cfg.extensions.some((ext) => foundExts.has(ext));
           if (overlap || runningKeys.has(key)) {
-            buckets.set(key, { key, serverConfig: cfg, files: [] });
+            const runningState = Array.from(this.serverManager.getRunningServers().values()).find(
+              (s) => serverKey(s.config) === key
+            );
+            const openFiles = runningState?.documentManager.listOpen?.() ?? [];
+            const matchingOpenFiles = openFiles.filter((file) =>
+              cfg.extensions.includes(getExtension(file))
+            );
+            const fallbackFiles = overlap
+              ? await this.resolveWorkspaceFilesForServer(cfg, rootDir, respectGitignore, maxFiles)
+              : [];
+            buckets.set(key, {
+              key,
+              serverConfig: cfg,
+              files: dedupeStrings([...matchingOpenFiles, ...fallbackFiles]),
+            });
           } else {
             logger.debug(
               `[getDiagnosticsBatch] Skipping bucket for ${key}: no matching extensions in ${rootDir}\n`
@@ -500,17 +514,20 @@ export class LSPClient {
 
     // 5. Dedup defensively by (uri, line, character, code).
     const seen = new Set<string>();
-    const dedupedItems: DiagnosticsByFile[] = [];
+    const dedupedByUri = new Map<string, Diagnostic[]>();
     for (const file of items) {
-      const kept: Diagnostic[] = [];
+      const kept = dedupedByUri.get(file.uri) ?? [];
       for (const d of file.items) {
         const key = `${file.uri}|${d.range.start.line}|${d.range.start.character}|${d.code ?? ''}|${d.message}`;
         if (seen.has(key)) continue;
         seen.add(key);
         kept.push(d);
       }
-      dedupedItems.push({ uri: file.uri, items: kept });
+      dedupedByUri.set(file.uri, kept);
     }
+    const dedupedItems: DiagnosticsByFile[] = Array.from(dedupedByUri.entries()).map(
+      ([uri, items]) => ({ uri, items })
+    );
 
     const filesWithDiagnostics = dedupedItems.filter((f) => f.items.length > 0).length;
     const filesConsidered = workspaceScope ? dedupedItems.length : files.length;
@@ -535,7 +552,7 @@ export class LSPClient {
 
   /**
    * One-shot per call: quick scan of `root` for the set of file extensions
-   * present (depth=2, respecting `.gitignore` when requested). Used by
+   * present (depth=5, respecting `.gitignore` when requested). Used by
    * workspace-scope bucket creation to skip servers whose extensions don't
    * appear in the tree.
    */
@@ -545,7 +562,7 @@ export class LSPClient {
   ): Promise<Set<string>> {
     try {
       const ig = respectGitignore ? await loadGitignore(rootDir) : undefined;
-      return await scanDirectoryForExtensions(rootDir, 2, ig, false);
+      return await scanDirectoryForExtensions(rootDir, 5, ig, false);
     } catch (err) {
       logger.debug(`[getDiagnosticsBatch] scanRootExtensions failed: ${err}\n`);
       return new Set();
@@ -597,6 +614,23 @@ export class LSPClient {
     } finally {
       serverState.inFlightBatchCount = Math.max(0, (serverState.inFlightBatchCount ?? 1) - 1);
     }
+  }
+
+  private async resolveWorkspaceFilesForServer(
+    cfg: LSPServerConfig,
+    rootDir: string,
+    respectGitignore: boolean,
+    maxFiles: number
+  ): Promise<string[]> {
+    const patterns = cfg.extensions.flatMap((ext) => [`*.${ext}`, `**/*.${ext}`]);
+    const result = await resolveFiles({
+      patterns,
+      root: rootDir,
+      respectGitignore,
+      includeUnopened: true,
+      maxFiles,
+    });
+    return result.files;
   }
 
   async hover(
@@ -727,6 +761,14 @@ export class LSPClient {
 function serverKey(config: LSPServerConfig): string {
   const root = config.rootDir ?? process.cwd();
   return `${config.command.join(' ')}@${root}`;
+}
+
+function getExtension(filePath: string): string {
+  return filePath.split('.').pop() ?? '';
+}
+
+function dedupeStrings(values: string[]): string[] {
+  return Array.from(new Set(values));
 }
 
 /**

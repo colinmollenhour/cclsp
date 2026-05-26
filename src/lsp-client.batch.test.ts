@@ -123,6 +123,7 @@ describe('LSPClient.getDiagnosticsBatch', () => {
 
     const result = await client.getDiagnosticsBatch({
       paths: [aTs, bPy],
+      root: TEST_DIR,
       timeBudgetMs: 5000,
     });
 
@@ -163,7 +164,7 @@ describe('LSPClient.getDiagnosticsBatch', () => {
 
     spyOn(getServerManager(client), 'getServer').mockResolvedValue(tsState);
 
-    await client.getDiagnosticsBatch({ paths: [aTs], timeBudgetMs: 2000 });
+    await client.getDiagnosticsBatch({ paths: [aTs], root: TEST_DIR, timeBudgetMs: 2000 });
 
     expect(observedDuring).toBe(1);
     // After return, must be back to 0.
@@ -188,13 +189,20 @@ describe('LSPClient.getDiagnosticsBatch', () => {
       return tsState;
     });
 
-    // workspace scope: empty paths/patterns; both buckets get per-file path
-    // (perFilePullBatch on zero files = empty result).
-    const result = await client.getDiagnosticsBatch({ timeBudgetMs: 2000 });
+    // workspace scope: empty paths/patterns; both buckets get per-file fallback
+    // files when workspace/diagnostic is unavailable.
+    const result = await client.getDiagnosticsBatch({ root: TEST_DIR, timeBudgetMs: 2000 });
     expect(result.buckets.length).toBe(2);
-    // No sendRequest because both buckets have 0 files in workspace mode here.
-    expect(tsState.transport.sendRequest).not.toHaveBeenCalled();
-    expect(pyState.transport.sendRequest).not.toHaveBeenCalled();
+    expect(tsState.transport.sendRequest).toHaveBeenCalledWith(
+      'textDocument/diagnostic',
+      { textDocument: { uri: pathToUri(join(TEST_DIR, 'src/a.ts')) } },
+      expect.any(Number)
+    );
+    expect(pyState.transport.sendRequest).toHaveBeenCalledWith(
+      'textDocument/diagnostic',
+      { textDocument: { uri: pathToUri(join(TEST_DIR, 'src/b.py')) } },
+      expect.any(Number)
+    );
 
     client.dispose();
   });
@@ -221,7 +229,7 @@ describe('LSPClient.getDiagnosticsBatch', () => {
       return tsState;
     });
 
-    await client.getDiagnosticsBatch({ timeBudgetMs: 2000 });
+    await client.getDiagnosticsBatch({ root: TEST_DIR, timeBudgetMs: 2000 });
 
     expect(tsState.transport.sendRequest).toHaveBeenCalledWith(
       'workspace/diagnostic',
@@ -247,7 +255,11 @@ describe('LSPClient.getDiagnosticsBatch', () => {
     });
     spyOn(getServerManager(client), 'getServer').mockRejectedValue(new Error('cannot start'));
 
-    const result = await client.getDiagnosticsBatch({ paths: [aTs], timeBudgetMs: 2000 });
+    const result = await client.getDiagnosticsBatch({
+      paths: [aTs],
+      root: TEST_DIR,
+      timeBudgetMs: 2000,
+    });
     expect(result.partial).toBe(true);
     expect(result.partialReasons).toContain('SERVER_CRASH');
     void tsState;
@@ -350,6 +362,7 @@ describe('LSPClient.getDiagnosticsBatch', () => {
 
     const result = await client.getDiagnosticsBatch({
       paths: [aTs, bPy],
+      root: TEST_DIR,
       timeBudgetMs: 150,
     });
 

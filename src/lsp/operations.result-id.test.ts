@@ -216,6 +216,43 @@ describe('workspaceDiagnostic result-id reuse (PR3)', () => {
     expect(cache.getResultId('file:///b.ts')).toBe('rid-B-1');
   });
 
+  it('clears prior result id when a full report omits resultId', async () => {
+    const firstFull: WorkspaceDocumentDiagnosticReport[] = [
+      {
+        uri: 'file:///a.ts',
+        kind: 'full',
+        version: 1,
+        resultId: 'rid-A-1',
+        items: [sampleDiag('a')],
+      },
+    ];
+    const secondFull: WorkspaceDocumentDiagnosticReport[] = [
+      {
+        uri: 'file:///a.ts',
+        kind: 'full',
+        version: 2,
+        items: [sampleDiag('a-updated')],
+      },
+    ];
+    let callCount = 0;
+    const transport = createMockTransport({
+      sendRequest: jest.fn(async () => {
+        callCount++;
+        return { items: callCount === 1 ? firstFull : secondFull };
+      }),
+    });
+    const cache = new DiagnosticsCache();
+    const state = buildState({ transport, diagnosticsCache: cache });
+
+    await workspaceDiagnostic(state, { deadline: Date.now() + 5000 });
+    expect(cache.getResultId('file:///a.ts')).toBe('rid-A-1');
+
+    await workspaceDiagnostic(state, { deadline: Date.now() + 5000 });
+
+    expect(cache.getResultId('file:///a.ts')).toBeUndefined();
+    expect(cache.listResultIds()).toEqual([]);
+  });
+
   it('unchanged report returns cached items', async () => {
     const firstFull: WorkspaceDocumentDiagnosticReport[] = [
       {

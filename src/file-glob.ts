@@ -1,5 +1,5 @@
 import { readdir, stat } from 'node:fs/promises';
-import { isAbsolute, join, normalize, relative, resolve, sep } from 'node:path';
+import { basename, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path';
 import picomatch from 'picomatch';
 import { loadGitignore } from './file-scanner.js';
 import { logger } from './logger.js';
@@ -47,6 +47,7 @@ export interface ResolveFilesResult {
 }
 
 const MAX_WALK_DEPTH = 20;
+const ALWAYS_IGNORED_DIRS = new Set(['node_modules', '.git', 'dist', 'build']);
 
 /**
  * Resolve a final list of absolute file paths from explicit `paths` and
@@ -86,6 +87,10 @@ export async function resolveFiles(opts: ResolveFilesOptions): Promise<ResolveFi
   if (opts.paths && opts.paths.length > 0) {
     for (const p of opts.paths) {
       const abs = isAbsolute(p) ? normalize(p) : normalize(resolve(root, p));
+      if (pathEscapesRoot(root, abs)) {
+        dropped.escaped++;
+        continue;
+      }
       finalSet.add(abs);
     }
   }
@@ -120,7 +125,7 @@ export async function resolveFiles(opts: ResolveFilesOptions): Promise<ResolveFi
       const ig = opts.respectGitignore ? await loadGitignore(root) : null;
 
       const candidates: string[] = [];
-      await walkDirectory(root, root, MAX_WALK_DEPTH, async (relPath, absPath) => {
+      await walkDirectory(root, root, MAX_WALK_DEPTH, ig, async (relPath, absPath) => {
         const normalizedRel = relPath.split(sep).join('/');
         if (ig?.ignores(normalizedRel)) {
           dropped.gitignored++;
@@ -164,6 +169,7 @@ async function walkDirectory(
   rootDir: string,
   dir: string,
   maxDepth: number,
+  ig: Awaited<ReturnType<typeof loadGitignore>> | null,
   visit: (relPath: string, absPath: string) => Promise<void>,
   currentDepth = 0
 ): Promise<void> {
@@ -188,7 +194,11 @@ async function walkDirectory(
 
     const rel = relative(rootDir, abs);
     if (st.isDirectory()) {
-      await walkDirectory(rootDir, abs, maxDepth, visit, currentDepth + 1);
+      const normalizedRel = rel.split(sep).join('/');
+      if (ALWAYS_IGNORED_DIRS.has(basename(abs)) || ig?.ignores(normalizedRel)) {
+        continue;
+      }
+      await walkDirectory(rootDir, abs, maxDepth, ig, visit, currentDepth + 1);
     } else if (st.isFile()) {
       await visit(rel, abs);
     }
@@ -213,4 +223,9 @@ function escapesRoot(root: string, pattern: string): boolean {
   // Relative: any `..` segment is suspicious.
   const segments = pattern.split(/[\\/]/);
   return segments.some((s) => s === '..');
+}
+
+function pathEscapesRoot(root: string, absPath: string): boolean {
+  const rel = relative(root, absPath);
+  return rel.startsWith('..') || isAbsolute(rel);
 }

@@ -345,6 +345,7 @@ function renderReasonBanner(reason: PartialReason, args: HeaderArgs): string[] {
 export interface RenderBatchResult {
   text: string;
   autoFallback?: 'by_file_to_summary';
+  hardTruncated?: boolean;
 }
 
 export interface RenderBatchOptions {
@@ -390,11 +391,13 @@ export function renderBatch(
 
   let text = headerWithGap + body;
   const finalSize = Buffer.byteLength(text);
+  let hardTruncated = false;
   if (finalSize > opts.maxBytes) {
     text = hardTruncate(text, opts.maxBytes, format);
+    hardTruncated = true;
   }
 
-  return autoFallback ? { text, autoFallback } : { text };
+  return { text, autoFallback, hardTruncated };
 }
 
 function renderBody(
@@ -548,7 +551,7 @@ function hardTruncate(text: string, maxBytes: number, format: RenderFormat): str
   if (format === 'json') {
     // Try to close the fence cleanly.
     if (sliced.includes('```json')) {
-      out = sliced.replace(/```json[\s\S]*$/, '```json\n  /* truncated */\n```');
+      out = sliced.includes('\n```') ? sliced : `${sliced}\n\`\`\``;
     }
   }
   return out + marker;

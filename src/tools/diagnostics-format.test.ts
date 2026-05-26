@@ -221,6 +221,24 @@ describe('renderBatch formats', () => {
     });
     expect(Buffer.byteLength(r.text)).toBeLessThanOrEqual(500);
     expect(r.text).toContain('output truncated');
+    expect(r.hardTruncated).toBe(true);
+  });
+
+  it('hard-truncates json without deleting the surviving payload', () => {
+    const items: Diagnostic[] = [];
+    for (let i = 0; i < 100; i++) {
+      items.push(mkDiag({ message: `lorem ipsum dolor sit amet ${i}` }));
+    }
+    const r = renderBatch([mkFile('file:///a.ts', items)], {
+      format: 'json',
+      groupBy: 'file',
+      maxBytes: 500,
+      header: 'HEADER',
+    });
+    expect(r.text).toContain('```json');
+    expect(r.text).toContain('file:///a.ts');
+    expect(r.text).not.toContain('/* truncated */');
+    expect(r.hardTruncated).toBe(true);
   });
 });
 

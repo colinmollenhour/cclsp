@@ -1099,8 +1099,8 @@ function mergeReports(
         byUri.set(entry.uri, items);
         // Persist the resultId + items so a later call can request
         // `unchanged` reports against them.
-        if (entry.resultId && cache.setResultId) {
-          cache.setResultId(entry.uri, entry.resultId);
+        if (cache.setResultId) {
+          cache.setResultId(entry.uri, entry.resultId ?? '');
         }
         // Always write through items so `kind: 'unchanged'` reuse on the
         // next call has fresh data, even when the server omitted resultId.
@@ -1116,8 +1116,8 @@ function mergeReports(
           if (!byUri.has(entry.uri)) byUri.set(entry.uri, []);
         }
         // Refresh the resultId so the server's latest opaque token wins.
-        if (entry.resultId && cache.setResultId) {
-          cache.setResultId(entry.uri, entry.resultId);
+        if (cache.setResultId) {
+          cache.setResultId(entry.uri, entry.resultId ?? '');
         }
       }
     }
@@ -1259,12 +1259,10 @@ async function runPerFileBucket(
 
     try {
       if (!wasOpen) {
-        if (serverState.documentManager.ensureOpenAsync) {
-          await serverState.documentManager.ensureOpenAsync(file);
-        } else {
-          await serverState.documentManager.ensureOpen(file);
-        }
-        openedByMe.add(file);
+        const opened = serverState.documentManager.ensureOpenAsync
+          ? await serverState.documentManager.ensureOpenAsync(file)
+          : await serverState.documentManager.ensureOpen(file);
+        if (opened) openedByMe.add(file);
       }
     } catch (err) {
       logger.debug(`[DEBUG ${logTag}] Could not open ${file}: ${err}\n`);

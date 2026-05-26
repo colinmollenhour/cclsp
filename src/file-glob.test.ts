@@ -93,10 +93,10 @@ describe('resolveFiles', () => {
     const rel = r.files.map((f) => f.replace(TEST_DIR, ''));
     // `dist/out.js` filtered by .gitignore, `node_modules/lib.js` by defaults.
     expect(rel).toEqual([join('/src', 'c.js')]);
-    expect(r.droppedCounts.gitignored).toBeGreaterThan(0);
+    expect(r.droppedCounts.gitignored).toBe(0);
   });
 
-  it('disables gitignore filtering when respectGitignore=false', async () => {
+  it('still skips always-ignored directories when respectGitignore=false', async () => {
     const r = await resolveFiles({
       patterns: ['**/*.js'],
       root: TEST_DIR,
@@ -105,7 +105,8 @@ describe('resolveFiles', () => {
       maxFiles: 100,
     });
     const rel = r.files.map((f) => f.replace(TEST_DIR, '')).sort();
-    expect(rel).toContain(join('/dist', 'out.js'));
+    expect(rel).not.toContain(join('/dist', 'out.js'));
+    expect(rel).not.toContain(join('/node_modules', 'lib.js'));
     expect(rel).toContain(join('/src', 'c.js'));
   });
 
@@ -119,6 +120,18 @@ describe('resolveFiles', () => {
     });
     expect(r.files).toEqual([]);
     expect(r.droppedCounts.escaped).toBeGreaterThan(0);
+  });
+
+  it('rejects explicit paths that escape the root', async () => {
+    const r = await resolveFiles({
+      paths: ['../../etc/passwd', '/etc/passwd'],
+      root: TEST_DIR,
+      respectGitignore: false,
+      includeUnopened: true,
+      maxFiles: 100,
+    });
+    expect(r.files).toEqual([]);
+    expect(r.droppedCounts.escaped).toBe(2);
   });
 
   it('enforces maxFiles cap and reports the drop count', async () => {

@@ -37,7 +37,11 @@ export class DiagnosticsCache {
    * answer with `kind: 'unchanged'` reports.
    */
   setResultId(uri: string, resultId: string): void {
-    this.resultIds.set(uri, resultId);
+    if (resultId) {
+      this.resultIds.set(uri, resultId);
+    } else {
+      this.resultIds.delete(uri);
+    }
   }
 
   /**

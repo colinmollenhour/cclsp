@@ -325,9 +325,9 @@ function renderWorkspaceDiagnosticsResult(
     header: tentativeHeader,
   });
 
-  // If by_file → summary fallback occurred, MAX_BYTES is the partial reason.
+  // If output exceeded max_bytes, MAX_BYTES is the partial reason.
   let finalText = rendered.text;
-  if (rendered.autoFallback === 'by_file_to_summary') {
+  if (rendered.autoFallback === 'by_file_to_summary' || rendered.hardTruncated) {
     partialReasons.add('MAX_BYTES');
     const finalHeader = renderHeader({
       status: 'PARTIAL',
@@ -352,13 +352,13 @@ function renderWorkspaceDiagnosticsResult(
       partialBuckets: batchResult.partialBucketKeys,
       completedBuckets: batchResult.completedBucketKeys,
       droppedCounts: batchResult.droppedCounts,
-      autoFallback: 'by_file_to_summary',
+      autoFallback: rendered.autoFallback,
       budgetMs: parsed.timeBudgetMs,
       resultsCollected: filterRes.counts.totalAfter,
       filesCollected: filesWithDiagnostics,
     });
     const reRendered = renderBatch(filterRes.filtered, {
-      format: 'summary',
+      format: rendered.autoFallback === 'by_file_to_summary' ? 'summary' : parsed.format,
       groupBy: parsed.groupBy,
       maxBytes: parsed.maxBytes,
       header: finalHeader,

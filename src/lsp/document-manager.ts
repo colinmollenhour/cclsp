@@ -60,6 +60,10 @@ export class DocumentManager {
 
     try {
       const fileContent = await fsPromises.readFile(filePath, 'utf-8');
+      if (this.openFiles.has(filePath)) {
+        logger.debug(`[DEBUG ensureOpenAsync] File opened during async read: ${filePath}\n`);
+        return false;
+      }
       this.openWithContent(filePath, fileContent);
       return true;
     } catch (error) {
