@@ -62,8 +62,8 @@ describe('ServerManager deferred restart', () => {
     manager = new ServerManager();
   });
 
-  afterEach(() => {
-    manager.dispose();
+  afterEach(async () => {
+    await manager.dispose();
     rmSync(TEST_DIR, { recursive: true, force: true });
   });
 

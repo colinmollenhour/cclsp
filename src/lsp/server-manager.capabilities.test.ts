@@ -64,8 +64,8 @@ describe('ServerManager capabilities capture', () => {
     manager = new ServerManager();
   });
 
-  afterEach(() => {
-    manager.dispose();
+  afterEach(async () => {
+    await manager.dispose();
     rmSync(TEST_DIR, { recursive: true, force: true });
   });
 
@@ -176,8 +176,8 @@ describe('ServerManager client capabilities in initialize params', () => {
     manager = new ServerManager();
   });
 
-  afterEach(() => {
-    manager.dispose();
+  afterEach(async () => {
+    await manager.dispose();
     rmSync(TEST_DIR, { recursive: true, force: true });
   });
 

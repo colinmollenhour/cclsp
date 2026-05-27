@@ -15,6 +15,20 @@ import type {
   ServerState,
 } from './types.js';
 
+function waitForProcessExit(childProcess: ChildProcess): Promise<void> {
+  if (childProcess.exitCode !== null || childProcess.signalCode !== null) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    const timeout = setTimeout(resolve, 1000);
+    childProcess.once('exit', () => {
+      clearTimeout(timeout);
+      resolve();
+    });
+  });
+}
+
 /**
  * Manages LSP server process lifecycles.
  *
@@ -84,14 +98,20 @@ export class ServerManager {
   /**
    * Terminate all running servers and clean up resources.
    */
-  dispose(): void {
+  async dispose(): Promise<void> {
+    const exitPromises: Promise<void>[] = [];
+
     for (const serverState of this.servers.values()) {
       if (serverState.restartTimer) {
         clearTimeout(serverState.restartTimer);
       }
+
+      exitPromises.push(waitForProcessExit(serverState.process));
       serverState.process.kill();
     }
     this.servers.clear();
+
+    await Promise.all(exitPromises);
   }
 
   private isPylspServer(serverConfig: LSPServerConfig): boolean {
