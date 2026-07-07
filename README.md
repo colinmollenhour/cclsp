@@ -231,31 +231,28 @@ Configure in your MCP client (e.g., Claude Code):
 }
 ```
 
-#### Restricting cclsp tools in Claude Code
+#### Disabling cclsp tools
 
-To disable refactoring and call-hierarchy tools while keeping only `find_*`, diagnostics, and server restart tools available, add Claude Code permissions like this. The `cclsp` segment in each tool name must match your MCP server key above.
+You can hide and disable specific MCP tools directly in `cclsp.json` with the top-level `tools` field. Tools not listed default to enabled; set a tool to `false` to disable it.
+
+For example, to disable refactoring, hover, and call-hierarchy tools while keeping `find_*`, diagnostics, and server restart tools available:
 
 ```json
 {
-  "permissions": {
-    "allow": [
-      "mcp__cclsp__find_definition",
-      "mcp__cclsp__find_references",
-      "mcp__cclsp__find_implementation",
-      "mcp__cclsp__find_workspace_symbols",
-      "mcp__cclsp__get_diagnostics",
-      "mcp__cclsp__get_workspace_diagnostics",
-      "mcp__cclsp__restart_server"
-    ],
-    "deny": [
-      "mcp__cclsp__rename_symbol",
-      "mcp__cclsp__rename_symbol_strict",
-      "mcp__cclsp__get_hover",
-      "mcp__cclsp__prepare_call_hierarchy",
-      "mcp__cclsp__get_incoming_calls",
-      "mcp__cclsp__get_outgoing_calls"
-    ]
-  }
+  "tools": {
+    "rename_symbol": false,
+    "rename_symbol_strict": false,
+    "get_hover": false,
+    "prepare_call_hierarchy": false,
+    "get_incoming_calls": false,
+    "get_outgoing_calls": false
+  },
+  "servers": [
+    {
+      "extensions": ["ts", "tsx", "js", "jsx"],
+      "command": ["typescript-language-server", "--stdio"]
+    }
+  ]
 }
 ```
 
@@ -332,6 +329,7 @@ Alternatively, create an `cclsp.json` configuration file manually:
 - `rootDir`: Working directory for the LSP server (optional, defaults to ".")
 - `restartInterval`: Auto-restart interval in minutes (optional)
 - `initializationOptions`: LSP server initialization options (optional)
+- `tools`: Top-level map of MCP tool names to enabled status (optional; omitted tools default to enabled)
 
 The `initializationOptions` field allows you to customize how each LSP server initializes. This is particularly useful for servers like `pylsp` (Python) that have extensive plugin configurations, or servers like `devsense-php-ls` that require specific settings.
 
