@@ -282,7 +282,7 @@ export class LSPClient {
 
   async getDiagnostics(filePath: string): Promise<Diagnostic[]> {
     const serverState = await this.getServer(filePath);
-    return opsGetDiagnostics(serverState, filePath);
+    return opsGetDiagnostics(serverState, filePath, this.config.diagnostics);
   }
 
   /**

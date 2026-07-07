@@ -7,6 +7,7 @@ import type {
   CallHierarchyIncomingCall,
   CallHierarchyItem,
   CallHierarchyOutgoingCall,
+  Config,
   Diagnostic,
   DiagnosticsByFile,
   DocumentDiagnosticReport,
@@ -598,7 +599,8 @@ export async function findSymbolsByName(
 
 export async function getDiagnostics(
   serverState: ServerState,
-  filePath: string
+  filePath: string,
+  diagnosticsConfig?: Config['diagnostics']
 ): Promise<Diagnostic[]> {
   logger.debug(`[DEBUG getDiagnostics] Requesting diagnostics for ${filePath}\n`);
 
@@ -609,10 +611,15 @@ export async function getDiagnostics(
   const cachedDiagnostics = serverState.diagnosticsCache.get(fileUri);
 
   if (cachedDiagnostics !== undefined) {
+    await serverState.diagnosticsCache.waitForIdle(fileUri, {
+      maxWaitTime: diagnosticsConfig?.maxWaitMs ?? 2000,
+      idleTime: diagnosticsConfig?.idleMs ?? 200,
+    });
+    const freshDiagnostics = serverState.diagnosticsCache.get(fileUri);
     logger.debug(
-      `[DEBUG getDiagnostics] Returning ${cachedDiagnostics.length} cached diagnostics from publishDiagnostics\n`
+      `[DEBUG getDiagnostics] Returning ${(freshDiagnostics || cachedDiagnostics).length} cached diagnostics from publishDiagnostics\n`
     );
-    return cachedDiagnostics;
+    return freshDiagnostics || cachedDiagnostics;
   }
 
   logger.debug(

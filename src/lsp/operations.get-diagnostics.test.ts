@@ -124,7 +124,7 @@ describe('opsGetDiagnostics (single-file op)', () => {
     rmSync(TEST_DIR, { recursive: true, force: true });
   });
 
-  it('returns cached publishDiagnostics when available (no transport request issued)', async () => {
+  it('waits for idle before returning cached publishDiagnostics (no transport request issued)', async () => {
     const transport = createMockTransport();
     const docManager = createMockDocumentManager();
     const cache = createMockDiagnosticsCache(new Map([[fileUri, DIAGS_A]]));
@@ -140,6 +140,10 @@ describe('opsGetDiagnostics (single-file op)', () => {
     expect(docManager.ensureOpen).toHaveBeenCalledWith(filePath);
     // Cached path must NOT issue a request.
     expect(transport.sendRequest).not.toHaveBeenCalled();
+    expect(cache.waitForIdle).toHaveBeenCalledWith(fileUri, {
+      maxWaitTime: 2000,
+      idleTime: 200,
+    });
   });
 
   it('returns items from textDocument/diagnostic when report is kind:full', async () => {
