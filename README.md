@@ -33,10 +33,16 @@ https://github.com/user-attachments/assets/52980f32-64d6-4b78-9cbf-18d6ae120cdd
 - [🔧 MCP Tools](#-mcp-tools)
   - [`find_definition`](#find_definition)
   - [`find_references`](#find_references)
+  - [`find_implementation`](#find_implementation)
   - [`rename_symbol`](#rename_symbol)
   - [`rename_symbol_strict`](#rename_symbol_strict)
   - [`get_diagnostics`](#get_diagnostics)
   - [`get_workspace_diagnostics`](#get_workspace_diagnostics)
+  - [`get_hover`](#get_hover)
+  - [`find_workspace_symbols`](#find_workspace_symbols)
+  - [`prepare_call_hierarchy`](#prepare_call_hierarchy)
+  - [`get_incoming_calls`](#get_incoming_calls)
+  - [`get_outgoing_calls`](#get_outgoing_calls)
   - [`restart_server`](#restart_server)
 - [💡 Real-world Examples](#-real-world-examples)
   - [Finding Function Definitions](#finding-function-definitions)
@@ -225,6 +231,34 @@ Configure in your MCP client (e.g., Claude Code):
 }
 ```
 
+#### Restricting cclsp tools in Claude Code
+
+To disable refactoring and call-hierarchy tools while keeping only `find_*`, diagnostics, and server restart tools available, add Claude Code permissions like this. The `cclsp` segment in each tool name must match your MCP server key above.
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "mcp__cclsp__find_definition",
+      "mcp__cclsp__find_references",
+      "mcp__cclsp__find_implementation",
+      "mcp__cclsp__find_workspace_symbols",
+      "mcp__cclsp__get_diagnostics",
+      "mcp__cclsp__get_workspace_diagnostics",
+      "mcp__cclsp__restart_server"
+    ],
+    "deny": [
+      "mcp__cclsp__rename_symbol",
+      "mcp__cclsp__rename_symbol_strict",
+      "mcp__cclsp__get_hover",
+      "mcp__cclsp__prepare_call_hierarchy",
+      "mcp__cclsp__get_incoming_calls",
+      "mcp__cclsp__get_outgoing_calls"
+    ]
+  }
+}
+```
+
 ### Configuration
 
 #### Interactive Configuration Generator
@@ -400,6 +434,16 @@ Find all references to a symbol across the entire workspace. Returns references 
 - `symbol_kind`: The kind of symbol (function, class, variable, method, etc.) (optional)
 - `include_declaration`: Whether to include the declaration (optional, default: true)
 
+### `find_implementation`
+
+Find implementations of an interface or abstract method. Returns locations of all implementations.
+
+**Parameters:**
+
+- `file_path`: The path to the file
+- `line`: The line number (1-indexed)
+- `character`: The character position in the line (1-indexed)
+
 ### `rename_symbol`
 
 Rename a symbol by name and kind in a file. **This tool now applies the rename to all affected files by default.** If multiple symbols match, returns candidate positions and suggests using rename_symbol_strict.
@@ -512,6 +556,54 @@ get_workspace_diagnostics — PARTIAL
 ```
 
 When you see a cap-hit banner, do NOT retry the same arguments — instead, narrow the scope with `paths`/`patterns`, raise `min_severity`, or raise the relevant cap up to its documented maximum.
+
+### `get_hover`
+
+Get hover information (documentation, type info) for a symbol at a specific position in a file.
+
+**Parameters:**
+
+- `file_path`: The path to the file
+- `line`: The line number (1-indexed)
+- `character`: The character position in the line (1-indexed)
+
+### `find_workspace_symbols`
+
+Search for symbols across the entire workspace by name. Returns matching symbols from all files.
+
+**Parameters:**
+
+- `query`: The symbol name or pattern to search for
+
+### `prepare_call_hierarchy`
+
+Get call hierarchy item at a position. Use this to prepare for incoming or outgoing call analysis.
+
+**Parameters:**
+
+- `file_path`: The path to the file
+- `line`: The line number (1-indexed)
+- `character`: The character position in the line (1-indexed)
+
+### `get_incoming_calls`
+
+Find all functions or methods that call the function at a position.
+
+**Parameters:**
+
+- `file_path`: The path to the file
+- `line`: The line number (1-indexed)
+- `character`: The character position in the line (1-indexed)
+
+### `get_outgoing_calls`
+
+Find all functions or methods called by the function at a position.
+
+**Parameters:**
+
+- `file_path`: The path to the file
+- `line`: The line number (1-indexed)
+- `character`: The character position in the line (1-indexed)
 
 ### `restart_server`
 
