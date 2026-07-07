@@ -14,6 +14,11 @@ export interface DiagnosticsConfig {
 export interface Config {
   servers: LSPServerConfig[];
   diagnostics?: DiagnosticsConfig;
+  /**
+   * Map of MCP tool names to enabled status. Tools not listed default to enabled;
+   * set a tool to false to hide and disable it.
+   */
+  tools?: Record<string, boolean>;
 }
 
 export interface Position {

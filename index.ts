@@ -55,7 +55,9 @@ const allTools = [
   ...serverTools,
 ];
 
-registerTools(server, allTools, lspClient);
+const enabledTools = allTools.filter((tool) => lspClient.tools?.[tool.name] !== false);
+
+registerTools(server, enabledTools, lspClient);
 
 process.on('SIGINT', () => {
   lspClient.dispose();

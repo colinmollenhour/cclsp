@@ -55,6 +55,10 @@ export class LSPClient {
     this.config = loadConfig(configPath);
   }
 
+  get tools(): Record<string, boolean> | undefined {
+    return this.config.tools;
+  }
+
   private getServerForFile(filePath: string): LSPServerConfig | null {
     const extension = filePath.split('.').pop();
     if (!extension) return null;
